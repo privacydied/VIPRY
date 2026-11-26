@@ -1012,6 +1012,14 @@ impl Host {
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
     }
+
+    /// Which card the device is on: vendor, device, subsystem and revision
+    /// (not the LUID, which changes with every start of the system).
+    pub(crate) fn adapter_id(&self) -> Option<[u32; 4]> {
+        // SAFETY: a plain query.
+        let desc = unsafe { self.adapter.as_ref()?.GetDesc1() }.ok()?;
+        Some([desc.VendorId, desc.DeviceId, desc.SubSysId, desc.Revision])
+    }
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).

@@ -198,14 +198,35 @@ pub fn keys(dir: &Path) -> Vec<String> {
 }
 
 /// What a driver's cached pipelines depend on besides the title's: the
-/// translator with its settings, and the driver.
+/// translator with its settings, the driver, and the card it caches them for
+/// (two cards can share one driver and not its cache).
 pub fn fingerprint() -> String {
+    let host = crate::host::host();
+    fingerprint_of(
+        &crate::shader_cache::translation(),
+        host.as_ref().map(|h| h.driver()),
+        host.as_ref().and_then(|h| h.adapter_id()),
+    )
+}
+
+fn fingerprint_of(translation: &[u8], driver: Option<i64>, adapter: Option<[u32; 4]>) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(&crate::shader_cache::translation());
-    if let Some(host) = crate::host::host() {
-        h.update(&host.driver().to_le_bytes());
+    h.update(translation);
+    if let Some(driver) = driver {
+        h.update(&driver.to_le_bytes());
+    }
+    if let Some(adapter) = adapter {
+        for id in adapter {
+            h.update(&id.to_le_bytes());
+        }
     }
     h.finalize().to_hex()[..16].to_owned()
+}
+
+/// The card's vendor and device, as `vendor:device` in hex (for a log line).
+pub fn adapter() -> Option<String> {
+    let [vendor, device, ..] = crate::host::host()?.adapter_id()?;
+    Some(format!("{vendor:04x}:{device:04x}"))
 }
 
 /// The translations of earlier runs are in `dir` (the pipeline library is
@@ -450,6 +471,21 @@ mod tests {
         assert_eq!(back.describe(), g.describe());
         assert!(GraphicsState::get(&bytes[..bytes.len() - 1]).is_none());
         assert!(GraphicsState::get(&bytes[..9]).is_none());
+    }
+
+    /// A pipeline made for one card is not taken as made for another on the
+    /// same driver.
+    #[test]
+    fn the_fingerprint_tells_cards_apart() {
+        let card = Some([0x10de, 0x2489, 0x1, 0xa1]);
+        let of = |driver, adapter| fingerprint_of(b"translator", driver, adapter);
+        assert_eq!(of(Some(7), card), of(Some(7), card));
+        assert_ne!(of(Some(7), card), of(Some(7), Some([0x10de, 0x1f08, 0x1, 0xa1])));
+        assert_ne!(of(Some(7), card), of(Some(7), Some([0x10de, 0x2489, 0x1, 0xa2])));
+        assert_ne!(of(Some(7), card), of(Some(8), card));
+        assert_ne!(of(Some(7), card), fingerprint_of(b"another", Some(7), card));
+        assert_eq!(of(None, None), of(None, None));
+        assert_eq!(of(None, None).len(), 16);
     }
 
     #[test]

@@ -61,8 +61,9 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     all.truncate(limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
+    let card = known::adapter().unwrap_or_else(|| "card not known".into());
     println!(
-        "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
+        "{} pipelines known, {} made before ({fingerprint}, {card}), {} bad; {} to make, {jobs} processes",
         keys.len(),
         done.len(),
         bad.len(),
