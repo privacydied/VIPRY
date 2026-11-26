@@ -1848,17 +1848,37 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
 /// refused, with 2,639 indirect draws and dispatches).
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_DYNAMIC_SLOTS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
+    static ASKED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
+        std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse().ok())
     });
-    if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+    let slots = dynamic_slots_for(count, null, asked);
+    if null < PORTABLE_VIEWS && slots != DYNAMIC {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                slots,
+                title_in_place = null.saturating_sub(slots),
+                "dynamic descriptor slots on a capped view heap (VICTORY_DYNAMIC_SLOTS); \
+                 title views past those kept in place read the null slot when picked by index"
+            );
+        });
     }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    slots
+}
+
+/// [`dynamic_slots`] with `VICTORY_DYNAMIC_SLOTS` as `asked`. On a host
+/// heap capped at [`PORTABLE_VIEWS`] (NVIDIA) the slots come out of the
+/// title's kept in place, so more than [`DYNAMIC`] only when asked, and at
+/// most half the heap: 2^18 ran out there too (1,100 to 4,800 tables
+/// refused a frame, each a dropped draw; asking 524,288, which half of a
+/// 1,000,000 heap holds to 499,999, took that to 0 to 33).
+/// Ported from trustno1-coder/VIctory-NVIDIA a9632bc8 (GPL-3.0).
+fn dynamic_slots_for(count: u32, null: u32, asked: Option<u32>) -> u32 {
+    if null < PORTABLE_VIEWS {
+        return asked.unwrap_or(DYNAMIC).min(null / 2).max(DYNAMIC);
+    }
+    null.saturating_sub(count).min(asked.unwrap_or(DYNAMIC << 2)).max(DYNAMIC)
 }
 
 impl HostHeap {
@@ -6514,6 +6534,23 @@ mod tests {
         let mut plain = TextureQueue::default();
         plain.written(40, 1, 0, false);
         assert!(plain.take_out(40));
+    }
+
+    #[test]
+    fn dynamic_slots_on_a_capped_heap_only_grow_when_asked() {
+        let capped = PORTABLE_VIEWS - 1;
+        assert_eq!(dynamic_slots_for(800_000, capped, None), DYNAMIC);
+        assert_eq!(dynamic_slots_for(800_000, capped, Some(393_216)), 393_216);
+        // The fork's 524,288 is past half of a 1,000,000 heap: 499,999.
+        assert_eq!(dynamic_slots_for(800_000, capped, Some(524_288)), capped / 2);
+        assert_eq!(dynamic_slots_for(800_000, capped, Some(1)), DYNAMIC);
+        // A heap smaller than two pools keeps one (no clamp panic).
+        assert_eq!(dynamic_slots_for(0, 300_000, Some(524_288)), DYNAMIC);
+        // Uncapped heaps as before: room past the title, up to four pools.
+        let uncapped = UNCAPPED_VIEWS - 1;
+        assert_eq!(dynamic_slots_for(1_000_000, uncapped, None), DYNAMIC << 2);
+        assert_eq!(dynamic_slots_for(1_000_000, uncapped, Some(300_000)), 300_000);
+        assert_eq!(dynamic_slots_for(uncapped, uncapped, None), DYNAMIC);
     }
 
     #[test]
