@@ -4508,6 +4508,8 @@ impl Host {
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         #[cfg(feature = "diagnostics")]
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
+                        // (Once for each buffer, however many copies lie in
+                        // it: codec-d/cool_fox 641835a4.)
                         if own.is_none() && before.is_some() && !ranges.is_empty() {
                             let raw = shadow.buffer.as_raw();
                             if !transitioned.contains(&raw) {
