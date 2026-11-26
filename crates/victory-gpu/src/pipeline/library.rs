@@ -95,6 +95,18 @@ fn holds() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_HANDLE").is_none_or(|v| v != "0"))
 }
 
+/// Whether the mapped library's file is read into memory at once when the
+/// library opens (`VICTORY_LIBRARY_PREFETCH=1`; off by default). A warm run
+/// loads ~4,500 pipelines from it at boot, each a page fault or more into a
+/// 690 MB file, while the title streams its own data from disk; in the runs
+/// whose boot queue drained slowly (2,300 of 4,500 loaded in 20 s, the rest
+/// still queued when the world began) the file was likely not in Windows'
+/// cache. One large request instead of scattered 4 KB reads, at t≈1 s.
+fn prefetch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_PREFETCH").is_some_and(|v| v == "1"))
+}
+
 /// A whole file mapped into memory: read-only (the library's file) or
 /// writable (the file a save fills). Unmapped when dropped.
 struct Mapped {
@@ -172,6 +184,17 @@ impl Mapped {
             .ok()?;
         file.set_len(len as u64).ok()?;
         Mapped::map(&file, len, true)
+    }
+
+    /// Asks Windows to read the whole view into memory in large reads
+    /// ([`prefetch`]); whether it took the request.
+    fn prefetch(&self) -> bool {
+        use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
+        let range = WIN32_MEMORY_RANGE_ENTRY { VirtualAddress: self.at.Value, NumberOfBytes: self.len };
+        // SAFETY: our own live view of `len` bytes; only a hint to the system.
+        unsafe {
+            PrefetchVirtualMemory(windows_sys::Win32::System::Threading::GetCurrentProcess(), 1, &range, 0) != 0
+        }
     }
 
     fn bytes(&self) -> &[u8] {
@@ -544,6 +567,11 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     VIEW[1].store(file.len, Ordering::Relaxed);
                     VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
                     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+                    if prefetch() {
+                        let began = std::time::Instant::now();
+                        let asked = file.prefetch();
+                        tracing::info!(asked, bytes, ms = began.elapsed().as_millis() as u64, "pipeline library: whole file asked for at once (VICTORY_LIBRARY_PREFETCH=1)");
+                    }
                 }
                 return Some(Library {
                     library,
@@ -932,6 +960,19 @@ mod tests {
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
         assert!(!dir.path().join(NEXT_FILE).exists());
+    }
+
+    /// A mapped library file can be asked for at once, and still reads as
+    /// the file's bytes after.
+    #[test]
+    fn a_mapped_file_is_prefetched_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let bytes: Vec<u8> = (0..1_000_000u32).map(|i| (i * 13) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = Mapped::open_holding(&path, true).expect("mapped");
+        assert!(file.prefetch());
+        assert_eq!(file.bytes(), &bytes[..]);
     }
 
     /// The bytes at `at` of the pattern the test below writes.
