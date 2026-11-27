@@ -5,6 +5,11 @@
 
 use std::collections::HashMap;
 
+/// The log target of these lines: under `victory_gpu::host`, which the
+/// usual log settings (`VICTORY_LOG=warn,victory_gpu::host=info,...`) let
+/// through; this module's own path is filtered out there.
+const TARGET: &str = "victory_gpu::host::memory_map";
+
 /// Whether the address space is walked for the memory map line
 /// ([`log`]). On by default (this module is in diagnostics
 /// builds only); `VICTORY_MEMORY_MAP=0` leaves the walk out.
@@ -154,6 +159,7 @@ pub(crate) fn log() {
         .map(|k| format!("{} {} MB ({} MB in memory)", KINDS[k], committed[k] >> 20, present[k] >> 20))
         .collect();
     tracing::info!(
+        target: TARGET,
         "memory map ({} regions, {} ms): {}",
         regions.len(),
         started.elapsed().as_millis(),
@@ -192,6 +198,7 @@ pub(crate) fn log() {
         })
         .collect();
     tracing::info!(
+        target: TARGET,
         "memory map, other private allocations by size, the {} biggest groups of {} (committed): {}",
         biggest.len(),
         groups.len(),
@@ -224,6 +231,7 @@ pub(crate) fn line() {
     let (working, private) = process();
     let (free, left) = system();
     tracing::info!(
+        target: TARGET,
         "memory: private {} MB, working set {} MB; the PC: {} MB free, {} MB left to commit",
         private >> 20,
         working >> 20,
@@ -241,6 +249,7 @@ pub(crate) fn line() {
     let lists = &crate::host::LISTS;
     let (idle, idle_bytes) = crate::list::idle_now();
     tracing::info!(
+        target: TARGET,
         "memory: host lists made {}, preludes made {}, never reset {}; idle {} keeping {} MB of upload memory",
         lists[0].load(Relaxed),
         lists[1].load(Relaxed),
