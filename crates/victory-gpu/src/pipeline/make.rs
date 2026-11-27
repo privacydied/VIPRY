@@ -516,7 +516,7 @@ fn shared_budget() -> bool {
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
-    if budget.is_zero() {
+    if budget.is_zero() || super::spare::given_up(p) {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
@@ -749,43 +749,58 @@ fn workers() -> bool {
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
-            let screens_only = i >= workers;
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
-                    // Below the title's own threads (loading, recording),
-                    // and the streaming one, which is below normal itself
-                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
-                    loop {
-                        let p = next(screens_only);
-                        p.make();
-                        if p.was_slow.load(Ordering::Relaxed) {
-                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                            queue.slow_now -= 1;
-                            AVAILABLE.notify_all();
-                        }
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            } else {
-                running = true;
-            }
+            running |= spawn_worker(format!("victory-pipelines-{i}"), i >= workers);
         }
         running
     })
+}
+
+/// Starts a worker named `name`; whether it started. `screens_only`: it
+/// makes passes over the screen alone.
+pub(super) fn spawn_worker(name: String, screens_only: bool) -> bool {
+    let spawned = std::thread::Builder::new().name(name).spawn(move || {
+        // Below the title's own threads (loading, recording),
+        // and the streaming one, which is below normal itself
+        // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
+        let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+        // SAFETY: a plain call on our own thread.
+        unsafe {
+            use windows::Win32::System::Threading::*;
+            let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+            let _ = SetThreadPriority(GetCurrentThread(), priority);
+        }
+        let slot = super::spare::Slot::new(screens_only);
+        loop {
+            let p = next(screens_only);
+            let slow = p.was_slow.load(Ordering::Relaxed);
+            slot.begin(&p, slow);
+            p.make();
+            // A spare that took this worker's place gave the slow count back.
+            let replaced = slot.end();
+            if slow && !replaced {
+                slow_released();
+            }
+            if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                drained();
+            } else {
+                super::library::save(false);
+            }
+            if replaced {
+                return;
+            }
+        }
+    });
+    if let Err(e) = &spawned {
+        tracing::warn!(error = %e, "no pipeline worker");
+    }
+    spawned.is_ok()
+}
+
+/// A pipeline from the slow list is no longer being made ([`slow_limit`]).
+pub(super) fn slow_released() {
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    queue.slow_now -= 1;
+    AVAILABLE.notify_all();
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
