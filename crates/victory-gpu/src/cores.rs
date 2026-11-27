@@ -2,6 +2,8 @@
 //! of cores. `cpu_sets` and `keep_on_fast_cores` are fxceless/victory-fork's
 //! (`framelog.rs`, commit 0b0074e0, GPL-3.0-or-later, as this).
 
+pub(crate) mod lane_core;
+
 /// The system's processor sets of group 0: each one's id and its efficiency
 /// class (higher is faster).
 fn cpu_sets() -> Vec<(u32, u8)> {
