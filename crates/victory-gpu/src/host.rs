@@ -3876,7 +3876,7 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 mod card_time;
-mod copy_split;
+pub(crate) mod copy_split;
 pub(crate) mod indirects;
 mod font;
 mod front_plan;
@@ -8620,6 +8620,9 @@ impl Batch {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
+        if copy_split::on() {
+            copy_split::refreshed(started, copied);
+        }
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);

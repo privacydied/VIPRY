@@ -4051,7 +4051,12 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            let asking = crate::host::copy_split::on().then(std::time::Instant::now);
+            let answer = crate::watch::writes(from, to, true);
+            if let Some(began) = asking {
+                crate::host::copy_split::asked(began);
+            }
+            if let Some((now, written)) = answer {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
