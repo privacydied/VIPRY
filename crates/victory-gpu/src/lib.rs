@@ -134,6 +134,14 @@ pub fn frame_phase() -> u32 {
     copystat::phase()
 }
 
+/// What the submitting thread is doing, for the sampling profiler in a
+/// release build (which counts no frame phases): 0 between submissions,
+/// 1 preparing one, 2 waiting for the card to run it, 3 copying back.
+#[cfg(all(windows, not(feature = "diagnostics")))]
+pub fn frame_phase() -> u32 {
+    host::submitting_phase()
+}
+
 /// Frames the title has begun (its frame waits that ended), for logs.
 pub fn frames_begun() -> u64 {
     frame::current()

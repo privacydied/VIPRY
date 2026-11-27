@@ -590,6 +590,12 @@ fn submitting(phase: u64, lists: usize) {
     SUBMITTING[0].store(phase, Ordering::Relaxed);
 }
 
+/// [`SUBMITTING`]'s phase now, for the sampling profiler (`crate::frame_phase`).
+#[cfg(not(feature = "diagnostics"))]
+pub(crate) fn submitting_phase() -> u32 {
+    SUBMITTING[0].load(Ordering::Relaxed) as u32
+}
+
 /// What was going on when the host device went: whether a submission was
 /// on the card, the pipeline library's state and the calls running in it,
 /// and the trail.

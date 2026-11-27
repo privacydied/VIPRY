@@ -31,9 +31,11 @@ pub mod prepare;
 pub(crate) mod publish;
 pub mod resolution;
 pub mod resolve;
-#[cfg(all(windows, feature = "diagnostics"))]
+// The sampling profiler and the stack walks it uses: in every build, as
+// nothing runs unless `VICTORY_PROFILE` (or `VICTORY_STACKS`) is set.
+#[cfg(windows)]
 mod profile;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 mod stacks;
 #[cfg(windows)]
 mod threads;
@@ -54,9 +56,9 @@ pub use crash::{
 pub use crash::save_on_crash;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub use profile::profile_on_schedule;
 #[cfg(windows)]
 pub use threads::{disable_thread_calls, set_before_thread_shutdown};
