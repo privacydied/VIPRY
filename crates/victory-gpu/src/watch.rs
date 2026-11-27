@@ -30,6 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
 
+mod ask_noreset;
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -276,7 +278,6 @@ thread_local! {
 /// memory of one reservation. The caller holds the range ([`Asking`]).
 fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     FOUND.with(|found| {
         let mut found = found.borrow_mut();
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -289,7 +290,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
             GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
+                ask_noreset::flags(),
                 (first * PAGE) as *const _,
                 (last - first) * PAGE,
                 found.as_mut_ptr().cast(),
@@ -305,6 +306,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         if failed {
             return None;
         }
+        ask_noreset::reset_found(&found[..count]);
         #[cfg(feature = "diagnostics")]
         {
             tally(12, count as u64);
