@@ -21,6 +21,8 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+#[cfg(windows)]
+mod auto_a;
 // PS5 pads (DualSense, DualSense Edge) read straight from HID, USB or Bluetooth (from AnyXboxX's VIctory copy).
 #[cfg(any(windows, test))]
 mod dualsense;
@@ -1278,6 +1280,9 @@ mod host {
             }
             #[allow(unused_mut)]
             let mut pad = self.pads[slot]?;
+            if slot == 0 && super::auto_a::pressed() {
+                pad.buttons |= super::A;
+            }
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1298,6 +1303,9 @@ mod host {
                 return Vec::new();
             }
             let mut down = scripted();
+            if super::auto_a::pressed() && !down.contains(&0x0D) {
+                down.push(0x0D);
+            }
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
