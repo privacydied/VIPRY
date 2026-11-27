@@ -1,6 +1,6 @@
 //! Copies of single buffer views' own bytes ([`super::exact`]) found and
-//! made without one lock held over everything (`VICTORY_EXACT_FAST=1`, off
-//! by default).
+//! made without one lock held over everything (`VICTORY_EXACT_FAST`, on by
+//! default; `=0` turns it off).
 //!
 //! Why: the threads that translate lists (`list/thin.rs`) ask for such a copy
 //! for every buffer view off its copy's elements, when a slot is made and
@@ -16,13 +16,33 @@
 //! held; the walk over idle copies runs once a frame, or when the copies
 //! kept have doubled since the last walk. What is kept, and for how long,
 //! is as before.
+//!
+//! On by default: with it a list call took 12.9 us instead of 25 us, the
+//! list threads' summed translation time fell from about 900 to 490 ms a
+//! frame, and the median frame from 144.9 to 123.4 ms on this PC. `=0`
+//! gives the one mutex as before.
 
 use super::*;
 
-/// Whether it is asked for.
+/// Whether it is on: unset or anything but `0` is on.
 pub(super) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_FAST").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| enabled(std::env::var_os("VICTORY_EXACT_FAST").as_deref()))
+}
+
+fn enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn on_unless_zero() {
+        use std::ffi::OsStr;
+        assert!(super::enabled(None));
+        assert!(super::enabled(Some(OsStr::new("1"))));
+        assert!(!super::enabled(Some(OsStr::new("0"))));
+    }
 }
 
 /// A copy and the asking that last took it.
