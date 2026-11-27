@@ -24,6 +24,13 @@ pub(crate) enum Tag {
     Clamp,
     /// The iteration counter and limit test the translation adds to a loop.
     Counter,
+    /// A float operation written with LLVM's fast-math flags (the host may
+    /// compute it approximately: a reciprocal as the hardware's).
+    Fast,
+    /// A float division that may be computed as a multiply by the
+    /// reciprocal (LLVM's `arcp` alone): no assumption about NaN or
+    /// infinities.
+    Recip,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -378,10 +385,10 @@ impl Module {
     }
 
     /// Notes what instruction `v` is for (see [`Tag`]); only when modules
-    /// are counted.
+    /// are counted, except the tags the writer reads (`Fast`, `Recip`).
     pub fn tag(&mut self, v: V, tag: Tag) {
         if let V::Inst(i) = v
-            && census::enabled()
+            && (census::enabled() || matches!(tag, Tag::Fast | Tag::Recip))
         {
             self.tags.insert(i, tag);
         }
@@ -840,6 +847,14 @@ impl Module {
                     u64::from(inst_id - a)
                 };
                 match &inst.op {
+                    Op::Bin(op, a, b) if self.tags.get(&i) == Some(&Tag::Fast) => {
+                        // flags 1: unsafe algebra (`fast`), as DXC writes them
+                        w.record(2, &[rel(*a), rel(*b), *op as u64, 1]);
+                    }
+                    Op::Bin(op, a, b) if self.tags.get(&i) == Some(&Tag::Recip) => {
+                        // flags 16: allow reciprocal (`arcp`)
+                        w.record(2, &[rel(*a), rel(*b), *op as u64, 16]);
+                    }
                     Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
                     Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
                     Op::Cmp(p, a, b) => w.record(28, &[rel(*a), rel(*b), u64::from(*p)]),

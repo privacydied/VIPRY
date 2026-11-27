@@ -414,6 +414,57 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+/// `VICTORY_LEAN_MATH`: a set of bits, each a cheaper host form of a
+/// console float operation that differs from it only at NaN operands or in
+/// the sign of a zero (0 when unset, every form exact):
+/// - 1: the D3D9 multiply (`v_mul_legacy_f32`, `v_mac_legacy_f32`,
+///   `v_mad_legacy_f32`), see `legacy_mul`.
+/// - 2: `v_max_f32`/`v_min_f32` and their three-operand forms, see `max_min`.
+/// - 4: `v_med3_f32`, see `med3`.
+/// - 8: the D3D9 multiply as the plain product (one instruction), with
+///   the operations that make infinities kept from making them instead:
+///   `v_rcp_f32` takes a denominator of at least 1e-30 in size (a zero
+///   one becomes +1e-30), `v_rsq_f32` and `v_log_f32` an operand of at
+///   least 1e-30, `v_sqrt_f32` one of at least 0. An infinity that comes
+///   from memory or an overflow can still make a NaN (`0 * inf`).
+/// - 16: a pixel program's float outputs that are not finite become 0
+///   (a NaN reaching a target spreads through blur and bloom passes).
+/// - 32: `v_mad_f32`/`v_mac_f32` (and the D3D9 forms with bit 8) as one
+///   FMad, which the host may fuse (one rounding instead of two).
+/// - 64: `v_rcp_f32` as a `fast` division, which the host computes with
+///   its reciprocal instruction (as approximate as the console's) instead
+///   of a full division.
+/// - 128: the safe forms of the bits above, which keep the old bits'
+///   meaning otherwise: with 16, the finite filter also covers 16-bit
+///   pixel outputs and the vertex and mesh programs' parameters (not their
+///   position, clip or cull distances: a NaN there drops the primitive on
+///   the console too); with 8, a tiny or zero `v_rcp_f32` denominator keeps
+///   its sign (-1e-30, not +1e-30); with 64, the division only allows the
+///   reciprocal (`arcp`), not the whole fast-math set.
+///
+/// Ahead of [`host_rdna`]'s forms where both apply: the user asked for it.
+/// Part of the translation: the shader cache keys on the switch (the
+/// translator's `build.rs` lists every `VICTORY_*` it reads).
+pub fn lean_math() -> u32 {
+    #[cfg(test)]
+    if let Some(bits) = TEST_LEAN.get() {
+        return bits;
+    }
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| lean_bits(std::env::var("VICTORY_LEAN_MATH").ok().as_deref()))
+}
+
+/// [`lean_math`]'s bits from the switch's text (unset or not a number: 0).
+pub(super) fn lean_bits(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0) & 255
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`lean_math`], for its thread only.
+    pub(super) static TEST_LEAN: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
@@ -4013,10 +4064,12 @@ impl<'a> Lower<'a> {
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
     /// FMax/FMin, but -0 orders below +0 (RDNA2 ISA, `v_max_f32`), where
     /// the compare and select DXIL specifies gives either zero.
+    /// `VICTORY_LEAN_MATH` bit 2: DXIL's FMax/FMin alone (which zero of
+    /// two zeros comes out is the host's: six host instructions less).
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
-        if host_rdna() & super::rdna::MAX_MIN != 0 {
+        if lean_math() & 2 != 0 || host_rdna() & super::rdna::MAX_MIN != 0 {
             return r;
         }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
@@ -4147,11 +4200,30 @@ impl<'a> Lower<'a> {
         self.s.m.cmp(c, pred::IUGT, abs, inf)
     }
 
+    /// `f` where it is finite, else +0 (`VICTORY_LEAN_MATH` bit 16).
+    fn finite_or_zero(&mut self, f: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let magnitude = self.s.m.i32(0x7FFF_FFFF);
+        let m = self.s.m.bin(c, Bin::And, bits, magnitude);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let finite = self.s.m.cmp(c, pred::IULT, m, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, finite, f, zero)
+    }
+
     /// The median of three. With a NaN among them the hardware gives the
     /// minimum of the three instead (the host's minimum skips NaNs, so that
     /// is the smallest number among them).
+    /// `VICTORY_LEAN_MATH` bit 4: the median alone, without the NaN tests.
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
+        if lean_math() & 4 != 0 {
+            let lo = self.binary(36, a, b);
+            let hi = self.binary(35, a, b);
+            let t = self.binary(36, hi, third);
+            return self.binary(35, lo, t);
+        }
         // Between two constants in order: the lower one for a NaN either way.
         if host_rdna() & super::rdna::MED3 != 0 {
             let k = [a, b, third].map(|x| self.s.m.float_k(x));
@@ -4243,8 +4315,39 @@ impl<'a> Lower<'a> {
     }
 
     /// `0 × anything = 0`, as in D3D9.
+    ///
+    /// `VICTORY_LEAN_MATH` bit 1 (see [`lean_math`]): the same with fewer
+    /// host instructions. The exact form costs a multiply, two compares, an
+    /// or and a select. The lean form: a finite non-zero literal times
+    /// anything is the plain product, a zero literal gives 0, and otherwise
+    /// a product that is NaN (which `0 * inf` makes) or zero becomes +0: a
+    /// multiply, a compare and a select. What differs from the console: a
+    /// NaN operand gives 0 instead of NaN (where the other is not 0), a
+    /// product of non-zeros that underflows is +0, and a literal times -0
+    /// may be -0. Bit 8: the plain product alone.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        if lean_math() & 8 != 0 {
+            return self.s.m.bin(c, Bin::Mul, a, b);
+        }
+        if lean_math() & 1 != 0 {
+            for k in [a, b] {
+                if let Some(x) = self.s.m.float_k(k) {
+                    if x == 0.0 {
+                        return self.s.m.f32(0);
+                    }
+                    if x.is_finite() {
+                        return self.s.m.bin(c, Bin::Mul, a, b);
+                    }
+                }
+            }
+            // NaN or either zero -> +0: the console's sign for 0 * -x too
+            // (a -0 here turned a later reciprocal into -inf).
+            let m = self.s.m.bin(c, Bin::Mul, a, b);
+            let zero = self.s.m.f32(0);
+            let nan_or_zero = self.s.m.cmp(c, pred::UEQ, m, zero);
+            return self.s.m.select(c, nan_or_zero, zero, m);
+        }
         if host_rdna() & super::rdna::LEGACY != 0 {
             let m = self.s.m.bin(c, Bin::Mul, a, b);
             let zero = self.s.m.f32(0);
@@ -8838,8 +8941,10 @@ impl<'a> Lower<'a> {
                         self.as_float(x)
                     }
                 };
+                let lean_mac = lean_math() & 32 != 0 && (name == "v_mac_f32" || lean_math() & 8 != 0);
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
+                    _ if lean_mac => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
@@ -8853,6 +8958,10 @@ impl<'a> Lower<'a> {
             }
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                if lean_math() & 32 != 0 && (name != "v_mad_legacy_f32" || lean_math() & 8 != 0) {
+                    let r = self.fmad(a, bb, cc);
+                    return float(self, r);
+                }
                 let m = if name == "v_mad_legacy_f32" {
                     self.legacy_mul(a, bb)
                 } else {
@@ -8878,15 +8987,48 @@ impl<'a> Lower<'a> {
             }
             "v_rcp_f32" | "v_rcp_iflag_f32" => {
                 // shortcut: the hardware reciprocal is approximate (1 ULP); this divides.
-                let a = f(self, 0)?;
+                let mut a = f(self, 0)?;
+                if lean_math() & 8 != 0 {
+                    // |a| < 1e-30 (NaN too: unordered) -> 1e-30
+                    let small = self.s.m.f32(1e-30f32.to_bits());
+                    let m = self.unary(6, a);
+                    let under = self.s.m.cmp(c, pred::ULT, m, small);
+                    // Bit 128: of the sign of `a` (-0 and tiny negatives
+                    // give -1e30, as -inf on the console, not +1e30).
+                    let floor = if lean_math() & 128 != 0 {
+                        let bits = self.as_int(a);
+                        let sign = self.s.m.i32(0x8000_0000);
+                        let sign = self.s.m.bin(c, Bin::And, bits, sign);
+                        let k = self.s.m.i32(1e-30f32.to_bits());
+                        let signed = self.s.m.bin(c, Bin::Or, sign, k);
+                        self.as_float(signed)
+                    } else {
+                        small
+                    };
+                    a = self.s.m.select(c, under, floor, a);
+                }
                 let one = self.s.m.f32(1.0f32.to_bits());
                 let r = self.s.m.bin(c, Bin::SDiv, one, a);
+                if lean_math() & 64 != 0 {
+                    self.s.m.tag(r, if lean_math() & 128 != 0 { Tag::Recip } else { Tag::Fast });
+                }
                 float(self, r)
             }
             "v_rsq_f32" | "v_sqrt_f32" | "v_log_f32" | "v_exp_f32" | "v_fract_f32"
             | "v_trunc_f32" | "v_floor_f32" | "v_ceil_f32" | "v_rndne_f32" | "v_sin_f32"
             | "v_cos_f32" => {
-                let a = f(self, 0)?;
+                let mut a = f(self, 0)?;
+                if lean_math() & 8 != 0 {
+                    let floor = match name {
+                        "v_rsq_f32" | "v_log_f32" => Some(1e-30f32),
+                        "v_sqrt_f32" => Some(0.0f32),
+                        _ => None,
+                    };
+                    if let Some(floor) = floor {
+                        let k = self.s.m.f32(floor.to_bits());
+                        a = self.binary(35, a, k);
+                    }
+                }
                 let op = match name {
                     "v_rsq_f32" => 25,
                     "v_sqrt_f32" => 24,
@@ -12880,13 +13022,29 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            // `VICTORY_LEAN_MATH` bit 16: a pixel program's float outputs are
+            // made finite; with 128 also its 16-bit ones and the parameters
+            // of vertex and mesh programs (kind 0 or 16: not a position).
+            let safe = lean_math() & (16 | 128) == 16 | 128;
+            let param = matches!(el.kind, 0 | 16);
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if half.is_some() => {
+                    let mut f = self.as_float(x);
+                    if safe && (self.s.pixel || param) {
+                        f = self.finite_or_zero(f);
+                    }
+                    (".f32", f)
+                }
                 9 => {
-                    let f = match self.floats.get(&value) {
+                    let mut f = match self.floats.get(&value) {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
+                    if safe && param && !(self.s.pixel && !mesh)
+                        || lean_math() & 16 != 0 && self.s.pixel && !mesh
+                    {
+                        f = self.finite_or_zero(f);
+                    }
                     (".f32", f)
                 }
                 _ => (".i32", x),

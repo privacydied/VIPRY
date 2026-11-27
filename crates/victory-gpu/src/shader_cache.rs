@@ -76,6 +76,8 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            // The cheaper host forms of console float math change the code.
+            "VICTORY_LEAN_MATH",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

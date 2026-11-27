@@ -2058,6 +2058,79 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
     }
 }
 
+/// Lowers `body` with `VICTORY_LEAN_MATH` set to `bits` (this thread only).
+fn build_lean(body: &[u32], bits: u32) -> HostShader {
+    lower::TEST_LEAN.set(Some(bits));
+    let shader = build_valu_cs(body);
+    lower::TEST_LEAN.set(None);
+    shader
+}
+
+/// `VICTORY_LEAN_MATH` bits 1, 2 and 4 write shorter programs that give
+/// what the exact forms give, except at a NaN operand or in a zero's sign.
+#[test]
+fn lean_forms_give_the_exact_ones_but_at_nan_and_zero_sign() {
+    const MINUS_ONE: u16 = 243;
+    let (a, b, c) = (vgpr(1), vgpr(2), vgpr(3));
+    let bodies: [(&str, Vec<u32>); 8] = [
+        ("max", vop3(0x110, 0, a, b, 0).to_vec()),
+        ("min", vop3(0x10F, 0, a, b, 0).to_vec()),
+        ("max3", vop3(0x154, 0, a, b, c).to_vec()),
+        ("min3", vop3(0x151, 0, a, b, c).to_vec()),
+        ("med3", vop3(0x157, 0, a, b, c).to_vec()),
+        ("mul_legacy", vop3(0x107, 0, a, b, 0).to_vec()),
+        ("mul_legacy by a constant", vop3(0x107, 0, a, MINUS_ONE, 0).to_vec()),
+        ("mad_legacy", vop3(0x140, 0, a, b, c).to_vec()),
+    ];
+    let numbers = [0.0f32, -0.0, 1.0, -1.0, 0.3, -2.5e-7, 3e38, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+    let mut cases = Vec::new();
+    for (i, x) in numbers.iter().enumerate() {
+        for (j, y) in numbers.iter().enumerate() {
+            let z = numbers[(3 * i + j) % numbers.len()];
+            cases.push([x.to_bits(), y.to_bits(), z.to_bits(), 0]);
+        }
+    }
+    for (name, body) in bodies {
+        let shaders = [build_lean(&body, 0), build_lean(&body, 1 | 2 | 4)];
+        assert!(shaders[1].dxil.len() < shaders[0].dxil.len(), "{name}: not shorter");
+        let mut got: [Vec<(String, u32)>; 2] = [Vec::new(), Vec::new()];
+        for (shader, out) in shaders.iter().zip(&mut got) {
+            run_cases(shader, &cases, |backend, _, _, r| out.push((backend.to_string(), r)));
+        }
+        for (case, ((b0, was), (b1, is))) in cases.iter().cycle().zip(got[0].iter().zip(&got[1])) {
+            assert_eq!(b0, b1);
+            let (x, y) = (f32::from_bits(*was), f32::from_bits(*is));
+            let nan_in = case[..3].iter().any(|&w| f32::from_bits(w).is_nan());
+            let same = was == is || x.is_nan() && y.is_nan() || x == 0.0 && y == 0.0 || nan_in;
+            assert!(same, "{name} of {:?} on {b0}: {x} ({was:#x}), lean {y} ({is:#x})", case.map(f32::from_bits));
+        }
+    }
+}
+
+/// `VICTORY_LEAN_MATH` bits 8 and 128 keep a reciprocal of zero finite and
+/// of the zero's sign, and a square root of a negative at 0; bit 64 (here
+/// with 128: the `arcp` flag) writes a module the host accepts.
+#[test]
+fn lean_reciprocal_and_root_stay_finite() {
+    let rcp = [vop1(0x02a, 0, vgpr(1))];
+    let sqrt = [vop1(0x033, 0, vgpr(1))];
+    let checks: [(&[u32], u32, f32, f32); 5] = [
+        (&rcp, 8, 0.0, 1e30),
+        (&rcp, 8, -0.0, 1e30),
+        (&rcp, 8 | 128 | 64, -0.0, -1e30),
+        (&rcp, 8 | 128 | 64, 4.0, 0.25),
+        (&sqrt, 8, -4.0, 0.0),
+    ];
+    for (body, bits, x, want) in checks {
+        let shader = build_lean(body, bits);
+        run_cases(&shader, &[[x.to_bits(), 0, 0, 0]], |backend, _, _, r| {
+            let got = f32::from_bits(r);
+            let close = (got - want).abs() <= want.abs() * 1e-5;
+            assert!(close, "bits {bits} of {x} on {backend}: {got}, want {want}");
+        });
+    }
+}
+
 /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
 const fn mubuf_idxen(op: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
     [
