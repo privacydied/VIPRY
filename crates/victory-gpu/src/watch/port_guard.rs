@@ -248,8 +248,9 @@ pub(super) fn open_faulted(at: usize) -> (usize, std::time::Duration) {
 /// another range's) is left as it is, written: told so now, and looked at
 /// again at the next asking.
 pub(super) fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::time::Duration) -> Vec<usize> {
-    if !came.is_empty() {
-        // (Changes no block's protection: the sets of what is where.)
+    if !came.is_empty() || TO_SETTLE.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        // (Changes no block's protection: the sets of what is where. Also
+        // what faults that took no lock opened is settled by the lock alone.)
         let mut g = guards_timed();
         for &(block, view) in came {
             if g.absent.remove(block) && !view {
@@ -350,3 +351,10 @@ pub(super) fn forget_views(first: usize, last: usize) {
     }
 }
 
+
+/// Whether a guard's first looks (a view? all clean?) are made under the
+/// shared lock: with the switch, and none of what faults opened without the
+/// lock waits to be settled ([`settle`] is done by who holds it alone).
+pub(super) fn shared_looks() -> bool {
+    port_guard() && TO_SETTLE.load(std::sync::atomic::Ordering::SeqCst) == 0
+}

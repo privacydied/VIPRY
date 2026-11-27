@@ -34,7 +34,9 @@ mod ask_noreset;
 // Renderer port #6 (`VICTORY_PORT_GUARD`).
 mod port_guard;
 pub(crate) use port_guard::{port_guard, port_guard_line};
-use port_guard::{Claims, P6_NOT_ASKED, VIEWS, forget_views, guard_shared, known_views, open_faulted, port6_count, refused_as_view};
+use port_guard::{
+    Claims, P6_NOT_ASKED, VIEWS, forget_views, guard_shared, known_views, open_faulted, port6_count, refused_as_view, shared_looks,
+};
 #[cfg(test)]
 use port_guard::{P6_FAULTS, P6_GUARDS, PORT6, PORT_GUARD_IN_TEST};
 
@@ -2265,8 +2267,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
         && (PROTECTED.any(first, first + 1) || {
-            let g = guards_timed();
-            g.protected.contains(first) || g.absent.contains(first)
+            // (Renderer port #6: shared, a look only.)
+            let of = |g: &Guards| g.protected.contains(first) || g.absent.contains(first);
+            if shared_looks() { of(&guards_timed_shared()) } else { of(&guards_timed()) }
         });
     if !known && !is_view(start, end) {
         return None;
@@ -2277,14 +2280,24 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // other thread asks about it: `ASKING`); what the runtime tells meanwhile
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
-        let g = guards_timed();
-        if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) && !unsettled(first, last) {
-            // Nothing written, mapped or new since the range was last taken.
-            #[cfg(feature = "diagnostics")]
-            tally(3, 1);
-            return Some(Vec::new());
+        let of = |g: &Guards| -> Option<Vec<usize>> {
+            if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) && !unsettled(first, last) {
+                return None;
+            }
+            Some(g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect())
+        };
+        // (Renderer port #6: shared, a look only. A block a fault opens
+        // meanwhile was clean, read-only and unwritten when looked at.)
+        let unsure = if shared_looks() { of(&guards_timed_shared()) } else { of(&guards_timed()) };
+        match unsure {
+            Some(unsure) => unsure,
+            None => {
+                // Nothing written, mapped or new since the range was last taken.
+                #[cfg(feature = "diagnostics")]
+                tally(3, 1);
+                return Some(Vec::new());
+            }
         }
-        g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect()
     };
     let mut came: Vec<(usize, bool)> = Vec::new();
     let mut uncommitted_until = first;
