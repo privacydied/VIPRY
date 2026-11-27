@@ -3877,6 +3877,7 @@ pub(crate) mod awake;
 mod card_steps;
 mod card_time;
 pub(crate) mod copy_split;
+mod relay_lag;
 pub(crate) mod indirects;
 mod font;
 mod front_plan;
@@ -5141,6 +5142,7 @@ impl Host {
         }
         // In the order given: what tells the title the card is done.
         stage.next("landing: read-backs, telling the title");
+        let mut lag = relay_lag::landing(&self.queue);
         let mut last = 0;
         let mut landed = Vec::new();
         let mut telling = std::time::Instant::now();
@@ -5148,6 +5150,9 @@ impl Host {
             telling = match item {
                 Late::Run(mut flight) => {
                     last = flight.number;
+                    if let Some(lag) = &mut lag {
+                        lag.ran(flight.fence);
+                    }
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
@@ -5169,6 +5174,9 @@ impl Host {
                 }
                 Late::Signal(fence, value) => {
                     crate::fence::set(fence as crate::object::This, value);
+                    if let Some(lag) = &lag {
+                        lag.told();
+                    }
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
@@ -6011,6 +6019,9 @@ impl Host {
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
+            if let Some(slot) = card_time::last_slot().filter(|_| relay_lag::on()) {
+                relay_lag::sent(slot, *submitted);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
@@ -9453,6 +9464,7 @@ impl Meter {
         });
         // The card's own time when submissions are timed, else the wait.
         let gpu = card_time::line(frames, waited);
+        relay_lag::line(frames);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames

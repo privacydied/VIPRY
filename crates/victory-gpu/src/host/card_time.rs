@@ -28,7 +28,10 @@ use windows::core::Interface;
 use super::Host;
 
 /// Pairs of lists in the ring (a frame has some forty submissions).
-const SLOTS: usize = 1024;
+pub(super) const SLOTS: usize = 1024;
+
+/// The slot [`take`] gave last (`usize::MAX`: the submission is not timed).
+static LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 /// Whether submissions are timed on the card.
 pub(super) fn on() -> bool {
@@ -110,6 +113,7 @@ fn count_finished(ring: &Ring, state: &mut State) {
 /// The lists to put ahead of and behind the next submission, if it is timed.
 /// Both must be sent, the first ahead of everything, the second behind.
 pub(super) fn take(host: &Host) -> Option<(ID3D12CommandList, ID3D12CommandList)> {
+    LAST.store(usize::MAX, Ordering::Relaxed);
     if !on() {
         return None;
     }
@@ -133,7 +137,27 @@ pub(super) fn take(host: &Host) -> Option<(ID3D12CommandList, ID3D12CommandList)
     // sent will write it again until it is sent again.
     unsafe { std::ptr::write_bytes((ring.back as *mut u64).add(2 * slot), 0, 2) };
     state.taken += 1;
+    LAST.store(slot, Ordering::Relaxed);
     Some((ring.lists[slot].clone(), ring.lists[SLOTS + slot].clone()))
+}
+
+/// The slot of the submission [`take`] timed last, if it timed it
+/// ([`super::relay_lag`]).
+pub(super) fn last_slot() -> Option<usize> {
+    let slot = LAST.load(Ordering::Relaxed);
+    (slot < SLOTS).then_some(slot)
+}
+
+/// The card's ticks a second, once the ring is made.
+pub(super) fn frequency() -> Option<u64> {
+    RING.get()?.as_ref().map(|ring| ring.frequency)
+}
+
+/// When the submission in `slot` ended on the card, in its ticks, once the
+/// card has written it.
+pub(super) fn end_ticks(slot: usize) -> Option<u64> {
+    let ring = RING.get()?.as_ref()?;
+    times(ring.back, slot).map(|(_, to)| to)
 }
 
 /// For the frame line: the card's busy time per frame in ms, or `waited`
