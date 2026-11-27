@@ -112,6 +112,11 @@ enum Command {
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
     /// driver's cache on disk has them before a run needs one: once per change
     /// of the translator or the driver. Goes on where it was stopped.
+    ///
+    /// Pipelines that crash or hang the compiler are listed in `warm-bad.txt`
+    /// with the current fingerprint and retried automatically after a driver
+    /// or translator change. Set `VICTORY_WARM_BAD=0` to ignore `warm-bad.txt`
+    /// for this invocation.
     #[cfg(windows)]
     Warm {
         /// Processes at once (default: two thirds of the logical cores).
@@ -120,7 +125,7 @@ enum Command {
         /// At most this many pipelines.
         #[arg(long)]
         limit: Option<usize>,
-        /// Those made before too.
+        /// Retry pipelines already made or listed in `warm-bad.txt` too.
         #[arg(long)]
         again: bool,
         /// Only the pipelines earlier runs drew with.
