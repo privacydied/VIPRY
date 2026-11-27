@@ -3866,6 +3866,7 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 mod card_time;
+mod copy_split;
 pub(crate) mod indirects;
 mod font;
 mod front_plan;
@@ -8937,9 +8938,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let since = crate::watch::changes();
+    let timed = (!title_dst && copy_split::on()).then(std::time::Instant::now);
     // (A title destination that is away only while the runtime changes a
     // mapping beside it is written when that is done.)
     let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
+    if let Some(began) = timed {
+        copy_split::read(began, len);
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -9461,6 +9466,7 @@ impl Meter {
         crate::queue::behind_line(frames);
         crate::streamline::line(frames);
         card_clock_line(frames, ms);
+        copy_split::line(frames);
         crate::frame_wait::line(frames);
         two_queues::line(frames);
         #[cfg(feature = "diagnostics")]
