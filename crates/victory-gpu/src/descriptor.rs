@@ -204,6 +204,8 @@ fn mirror(handle: u64) {
     let Some(index) = heap.index(handle) else {
         return;
     };
+    // Renderer port #2: its record is looked at again with the title's own.
+    crate::port_descriptors::mark(handle);
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -469,17 +471,43 @@ pub(crate) fn sync_heaps() {
         kinds[4] += before.len() as u64 - of_tables;
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
-        let began = std::time::Instant::now();
-        let taken = written.take(start as usize, end as usize);
-        spent[0] += since(began);
-        let mut parts: Vec<(usize, usize)> = Vec::new();
-        for (range_from, range_end) in taken {
-            let mut page = range_from & !(crate::watch::PAGE - 1);
-            while page < range_end {
-                parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
-                page += crate::watch::PAGE;
+        // Ranges of the heap to look at, and whether a range is one the
+        // fallback of renderer port #2 looks at whole.
+        let mut parts: Vec<(usize, usize, bool)> = Vec::new();
+        let port = crate::port_descriptors::adopted(start);
+        if port {
+            // Renderer port #2: the slots the title's patched stores and our
+            // calls marked, in place of the changed pages; and a few of the
+            // pages the watch says were written, looked at whole.
+            let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
+            for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
+                let from = start as usize + first as usize * step as usize;
+                parts.push((from, from + n as usize * step as usize, false));
+            }
+            phase.end();
+            if crate::port_descriptors::ask_due(frame) {
+                let began = std::time::Instant::now();
+                let taken = written.take(start as usize, end as usize);
+                spent[0] += since(began);
+                crate::port_descriptors::asked(&taken);
+            }
+            for page in crate::port_descriptors::to_check(frame) {
+                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
+            }
+        } else {
+            let began = std::time::Instant::now();
+            let taken = written.take(start as usize, end as usize);
+            spent[0] += since(began);
+            for (range_from, range_end) in taken {
+                let mut page = range_from & !(crate::watch::PAGE - 1);
+                while page < range_end {
+                    parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end), false));
+                    page += crate::watch::PAGE;
+                }
             }
         }
+        // The marks' runs are short: more of them a job.
+        let pages_a_job = if port { pages_a_job.max(parts.len() / 48) } else { pages_a_job };
         // A few pages a thread at a time: read, compared with what was last
         // seen there and sorted out, beside one another (14 ms a frame of one
         // thread at 160 pages, run faults-6).
@@ -493,7 +521,8 @@ pub(crate) fn sync_heaps() {
             let mut page_bytes: Vec<u8> = Vec::new();
             let mut changed: Vec<u32> = Vec::new();
             let mut bits: Vec<u64> = Vec::new();
-            for &(from, to) in parts.chunks(pages_a_job).nth(n).unwrap_or_default() {
+            for &(from, to, check) in parts.chunks(pages_a_job).nth(n).unwrap_or_default() {
+                let checking = check.then(std::time::Instant::now);
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                 // A record that straddles the range's ends is left
                 // to the range that holds its first byte.
@@ -508,8 +537,11 @@ pub(crate) fn sync_heaps() {
                     // fails where a page is not there.
                     let whole =
                         unsafe { copied.changes_in_place(first as u32, lead as *const u8, count as usize, &mut bits, &mut changed) };
-                    out.pages += 1;
-                    out.views += u64::from(crate::watch::guarded(from, to));
+                    // (A run of marked slots is no page; nor does it ask the guards.)
+                    if !port || check {
+                        out.pages += 1;
+                        out.views += u64::from(crate::watch::guarded(from, to));
+                    }
                     out.bytes += (to - from) as u64;
                     out.looked += count;
                     out.short += u64::from(!whole);
@@ -526,8 +558,10 @@ pub(crate) fn sync_heaps() {
                     if !crate::host::read_into(from as *const u8, &mut page_bytes) {
                         continue;
                     }
-                    out.pages += 1;
-                    out.views += u64::from(crate::watch::guarded(from, to));
+                    if !port || check {
+                        out.pages += 1;
+                        out.views += u64::from(crate::watch::guarded(from, to));
+                    }
                     out.bytes += (to - from) as u64;
                     let Some(records) = page_bytes.get(lead.wrapping_sub(from)..) else {
                         continue;
@@ -550,6 +584,10 @@ pub(crate) fn sync_heaps() {
                             .and_then(|b| b.try_into().ok())
                             .map_or(0, u32::from_le_bytes)
                     };
+                    if check {
+                        // Renderer port #2's fallback: what no mark told of.
+                        crate::port_descriptors::missed(index, start + u64::from(index) * step, !samplers && word(0) == VIEW_TAG);
+                    }
                     if !samplers && word(0) == VIEW_TAG {
                         // A draw's own table: the draw makes what it
                         // reads of it (`draw.rs` `tables`).
@@ -583,6 +621,9 @@ pub(crate) fn sync_heaps() {
                     } else {
                         2
                     }] += 1;
+                }
+                if let Some(began) = checking {
+                    crate::port_descriptors::CHECKED[4].fetch_add(since(began), Relaxed);
                 }
             }
             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
@@ -737,6 +778,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
+    crate::port_descriptors::line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -897,6 +939,7 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        crate::port_descriptors::let_go(self.start);
     }
 }
 
@@ -1755,6 +1798,11 @@ pub(crate) extern "system" fn create_heap(
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
     });
+    // Renderer port #2: the title's own stores tell this heap's slots.
+    #[cfg(windows)]
+    if placed && visible && desc.kind == VIEWS_KIND {
+        crate::port_descriptors::adopt(start, desc.count);
+    }
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;

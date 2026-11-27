@@ -56,6 +56,8 @@ mod inplace;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
+pub mod port_descriptors;
+#[cfg(windows)]
 mod land;
 #[cfg(windows)]
 mod launch;
