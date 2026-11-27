@@ -220,7 +220,10 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = super::borderless::place(parent, style, width, height).unwrap_or_else(|| {
+        let (x, y, width, height) = fit(parent, x, y, width, height);
+        (style, x, y, width, height)
+    });
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -246,7 +249,10 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = super::borderless::place(parent, style, width, height).unwrap_or_else(|| {
+        let (x, y, width, height) = fit(parent, x, y, width, height);
+        (style, x, y, width, height)
+    });
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
