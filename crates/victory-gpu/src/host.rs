@@ -3853,6 +3853,7 @@ pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
 mod font;
+mod front_plan;
 mod menu;
 mod panel;
 mod place;
@@ -8586,7 +8587,10 @@ impl Batch {
         }
         let mut due = Vec::new();
         self.touches.clear();
-        for (n, list) in runs.iter().enumerate() {
+        // Renderer port #6: each list's part made on the threads beside, and
+        // joined in order (`front_plan`).
+        let wide = crate::watch::port_guard_plan() && runs.len() >= 2 && front_plan::steps(runs) >= front_plan::WIDE_STEPS;
+        for (n, list) in runs.iter().enumerate().take(if wide { 0 } else { runs.len() }) {
             if parts.contains(&n) {
                 self.touches.push(Touch::Part);
             }
@@ -8606,11 +8610,15 @@ impl Batch {
             }
         }
         planning.next("refreshes in front: the spans");
-        let found = front_spans(self.touches.drain(..));
-        let spans: Vec<_> = found
-            .into_iter()
-            .filter_map(|(key, from, to)| Some((self.spans.get(*self.spans_at.get(&key)?)?.0.clone(), from, to)))
-            .collect();
+        let spans: Vec<_> = if wide {
+            front_plan::spans(runs, parts, wide_textures(), |staging| self.texture_due(staging), &mut due)
+        } else {
+            let found = front_spans(self.touches.drain(..));
+            found
+                .into_iter()
+                .filter_map(|(key, from, to)| Some((self.spans.get(*self.spans_at.get(&key)?)?.0.clone(), from, to)))
+                .collect()
+        };
         planning.end();
         self.front = true;
         for (shadow, from, to) in &spans {
