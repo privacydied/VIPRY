@@ -89,6 +89,16 @@ before launch (harvestr python 3.9 GB, Firefox ~5 GB).
   intermediate). `9c49c062` fixes the diagnostics build.
 - Sampler: `linux/memsample.py <out.jsonl> [secs]` (run beside the game).
 
+## First run of `vipry-next` (11-27, release, `linux/vipry-next.env`, Series S, no DLSS)
+
+- Builds clean on trustno1 `18a8dc26` with all 9 VIPRY commits picked without conflicts.
+- Shader cache: 25,667 shaders, 222 do not translate, 254 s.
+- In the world: 0.5-1.9 fps; copies 270-1340 ms/frame (31-89 MB); ~600 draws/frame dropped,
+  ~770 pipelines being made; GPU 0-31 ms. Same class as VIPRY `main` (0.6 fps): gate not met.
+- 6 threads die of a 64 MB stack overflow, all at the same address `0x6ffffff93b22`
+  (a Wine module, not victory.exe): the same bug as on the old base.
+- Free RAM during play: 1-3 GB, 14 GB swap in use by other programs: RAM still sets the pace.
+
 ## Expectation
 
 foxhound's own table puts a 3080 + Ryzen 7 5700X at about 15 fps on Windows. A 3700X is slower,
