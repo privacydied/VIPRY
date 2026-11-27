@@ -88,6 +88,21 @@ pub(crate) fn note_builder(this: This) {
     }
 }
 
+/// Microseconds first uses waited for host pipelines since the last line:
+/// all waits, and those that ended with no pipeline made.
+static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A first use waited `waited` for a pipeline; `made`: it was made by then.
+pub(crate) fn waited(waited: std::time::Duration, made: bool) {
+    if on() {
+        let us = waited.as_micros() as u64;
+        WAITED_US[0].fetch_add(us, Ordering::Relaxed);
+        if !made {
+            WAITED_US[1].fetch_add(us, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Frames since the last line ([`frames`]); the counts run over all of them.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -112,6 +127,9 @@ pub(crate) fn line() {
     }
     let frames = FRAMES.swap(0, Ordering::Relaxed) as f64;
     let counts = COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+    let waited = WAITED_US
+        .each_ref()
+        .map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames.max(1.0));
     let map = BY_PIPELINE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -129,13 +147,16 @@ pub(crate) fn line() {
         .map(|c| counts[c])
         .sum();
     tracing::info!(
-        "dropped per frame by why (VICTORY_DROP_WHY=1): {:.1} not on purpose, over {frames:.0} frames: {}; in {} pipelines, the most: {}",
+        "dropped per frame by why (VICTORY_DROP_WHY=1): {:.1} not on purpose, over {frames:.0} frames: {}; \
+         waited for pipelines {:.1} ms a frame, {:.1} ms of it in vain; in {} pipelines, the most: {}",
         per_frame(unplanned_count),
         if classes.is_empty() {
             "none".to_owned()
         } else {
             classes.join(", ")
         },
+        waited[0],
+        waited[1],
         map.len(),
         most(map, NAMED)
             .iter()
