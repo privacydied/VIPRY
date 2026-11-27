@@ -88,11 +88,29 @@ pub(crate) fn note_builder(this: This) {
     }
 }
 
-/// The line, over `frames` frames since the last.
-pub(crate) fn line(frames: f64) {
+/// Frames since the last line ([`frames`]); the counts run over all of them.
+static FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// The frame line's window of `frames` frames has ended. The frame line
+/// counts every second and is printed every five; this line is printed
+/// with it and gives the mean over the frames of all those windows.
+pub(crate) fn frames(frames: u32) {
+    if on() {
+        FRAMES.fetch_add(u64::from(frames), Ordering::Relaxed);
+    }
+}
+
+/// Classes that are not dropped on purpose (by the ray-tracing switches).
+fn unplanned(class: usize) -> bool {
+    class != 1 && class != BUILDER
+}
+
+/// The line, over the frames since the last ([`frames`]).
+pub(crate) fn line() {
     if !on() {
         return;
     }
+    let frames = FRAMES.swap(0, Ordering::Relaxed) as f64;
     let counts = COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
     let map = BY_PIPELINE
         .lock()
@@ -106,8 +124,13 @@ pub(crate) fn line(frames: f64) {
         .filter(|(_, n)| *n > 0)
         .map(|(name, n)| format!("{name} {:.1}", per_frame(n)))
         .collect();
+    let unplanned_count: u64 = (0..CLASSES.len())
+        .filter(|&c| unplanned(c))
+        .map(|c| counts[c])
+        .sum();
     tracing::info!(
-        "dropped per frame by why (VICTORY_DROP_WHY=1): {}; in {} pipelines, the most: {}",
+        "dropped per frame by why (VICTORY_DROP_WHY=1): {:.1} not on purpose, over {frames:.0} frames: {}; in {} pipelines, the most: {}",
+        per_frame(unplanned_count),
         if classes.is_empty() {
             "none".to_owned()
         } else {
@@ -152,6 +175,13 @@ mod tests {
         let top = most(map, 3);
         let names: Vec<&str> = top.iter().map(|e| e.2.as_str()).collect();
         assert_eq!(names, ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn drops_on_purpose_are_not_counted_as_unplanned() {
+        assert!(!unplanned(1));
+        assert!(!unplanned(BUILDER));
+        assert!((0..CLASSES.len()).filter(|&c| unplanned(c)).count() == CLASSES.len() - 2);
     }
 
     #[test]

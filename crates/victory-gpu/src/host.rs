@@ -9461,6 +9461,7 @@ impl Meter {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        crate::pipeline::drop_why::frames(frames as u32);
         let indirect = crate::list::take_indirect() as f64 / frames;
         let left_out = crate::pipeline::take_left_out() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -9832,7 +9833,7 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
-            crate::pipeline::drop_why::line(frames);
+            crate::pipeline::drop_why::line();
             #[cfg(feature = "diagnostics")]
             {
                 let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
