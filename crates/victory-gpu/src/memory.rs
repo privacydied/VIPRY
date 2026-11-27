@@ -67,8 +67,7 @@
 //! [`SWEEP`] frames.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -211,15 +210,6 @@ struct Stats {
 unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
-
-/// Read-mostly cache mirroring initialized `Memory` metadata so concurrent
-/// `victory-list-*` threads executing `Use::Reads` draws with already-seen
-/// addresses never convoy on `MEMORY` (was up to 16.5 ms in Pass 32).
-static FAST_DIR_GPU: AtomicU64 = AtomicU64::new(0);
-static FAST_FAULTS_GPU: AtomicU64 = AtomicU64::new(0);
-static FAST_COPIES: AtomicUsize = AtomicUsize::new(0);
-static FAST_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-static FAST_HEAPS: RwLock<Option<HashMap<usize, (u32, u32)>>> = RwLock::new(None);
 
 /// What a draw binds.
 pub(crate) struct Ready {
@@ -913,260 +903,129 @@ pub(crate) fn ready(
     use_: Use,
     threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
-    const READ: usize = usize::MAX - 0x6d;
-    let frame = crate::frame::current();
-    let key = std::ptr::from_ref(heap) as usize;
-    let builds = use_ != Use::Reads;
-    let named = |kind: usize, at: u64| list.first_use(usize::MAX - (kind << 26) - (at / PAGE) as usize);
-
-    // Pre-filter `constants` and `addresses` through this list's own `first_use`
-    // set before taking the global `MEMORY` mutex, and serve repeated `Use::Reads`
-    // calls on already-initialized lists lock-free via `FAST_HEAPS.read()`.
-    let mut prefiltered = false;
-    let mut fresh_const_addrs: Vec<u64> = Vec::new();
-    let mut fresh_addrs: Vec<u64> = Vec::new();
-    let mut pre_first_read = false;
-    let mut pre_copies_key_new = false;
-    let mut pre_copies_seen = 0usize;
-
-    let diag_dump_on = {
-        #[cfg(feature = "diagnostics")]
-        {
-            dump::active()
-        }
-        #[cfg(not(feature = "diagnostics"))]
-        {
-            false
-        }
-    };
-
-    if !builds && !diag_dump_on {
-        let dir_gpu = FAST_DIR_GPU.load(Ordering::Acquire);
-        if dir_gpu != 0 {
-            prefiltered = true;
-            for (i, &c) in constants.iter().enumerate() {
-                if let Some(&high) = constants.get(i + 1)
-                    && (1..=0x1F).contains(&high)
-                    && c >= 0x1_0000
-                {
-                    let at = u64::from(c) | u64::from(high) << 32;
-                    if named(1, at) {
-                        fresh_const_addrs.push(at);
-                    }
-                }
-            }
-            for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
-                if named(2, at) {
-                    fresh_addrs.push(at);
-                }
-            }
-            pre_first_read = list.first_use(READ);
-            let copies = FAST_COPIES.load(Ordering::Acquire);
-            pre_copies_seen = copies;
-            pre_copies_key_new = list.first_use(usize::MAX - (6 << 33) - copies);
-            if fresh_const_addrs.is_empty()
-                && fresh_addrs.is_empty()
-                && !pre_first_read
-                && !pre_copies_key_new
-            {
-                let cached_base = FAST_HEAPS
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_ref()
-                    .and_then(|heaps| heaps.get(&key).copied())
-                    .and_then(|(base, made)| (made as usize == copies).then_some(base));
-                if let Some(base) = cached_base
-                    && FAST_COPIES.load(Ordering::Acquire) == copies
-                {
-                    // If a new frame started, let one thread try_lock for the
-                    // per-frame tick without blocking other `Use::Reads` threads.
-                    if FAST_FRAME.load(Ordering::Acquire) == frame {
-                        return Some(Ready {
-                            directory: dir_gpu,
-                            faults: FAST_FAULTS_GPU.load(Ordering::Acquire),
-                            base,
-                        });
-                    }
-                    if let Ok(mut guard) = MEMORY.try_lock() {
-                        if let Some(m) = guard.as_mut()
-                            && m.frame != frame
-                        {
-                            m.frame = frame;
-                            if frame.is_multiple_of(128) {
-                                m.refused.clear();
-                            }
-                            m.take_faults();
-                            m.look_again();
-                            m.report();
-                            #[cfg(feature = "diagnostics")]
-                            m.trace.look(frame);
-                            FAST_FRAME.store(frame, Ordering::Release);
-                            let new_copies = m.copies.len();
-                            if new_copies != copies {
-                                FAST_COPIES.store(new_copies, Ordering::Release);
-                            }
-                        }
-                    } else {
-                        return Some(Ready {
-                            directory: dir_gpu,
-                            faults: FAST_FAULTS_GPU.load(Ordering::Acquire),
-                            base,
-                        });
-                    }
-                    if FAST_COPIES.load(Ordering::Acquire) == copies {
-                        return Some(Ready {
-                            directory: dir_gpu,
-                            faults: FAST_FAULTS_GPU.load(Ordering::Acquire),
-                            base,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();
     }
     let m = guard.as_mut()?;
+    let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
-        if frame.is_multiple_of(128) {
-            m.refused.clear();
-        }
+        m.refused.clear();
         m.take_faults();
         m.look_again();
         m.report();
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
-        FAST_FRAME.store(frame, Ordering::Release);
     }
     #[cfg(feature = "diagnostics")]
     if use_ != Use::Reads {
         m.trace.dispatch(frame, list, addresses, written, constants, threads);
     }
+    let builds = use_ != Use::Reads;
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
+    // Once per list and page named: the builder dispatches hundreds of times
+    // a frame with the same arguments.
+    const READ: usize = usize::MAX - 0x6d;
+    let named = |kind: usize, at: u64| list.first_use(usize::MAX - (kind << 26) - (at / PAGE) as usize);
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units (the builder's alone). A constant that only
     // looks like one names memory nothing reads; one that is not the title's
     // memory is refused.
     let held = |m: &Memory| m.pages.len() as u64;
     let before = held(m);
-    if prefiltered {
-        for at in fresh_const_addrs {
-            m.ready(at, 1);
-        }
-    } else {
-        for (i, &c) in constants.iter().enumerate() {
-            if let Some(&high) = constants.get(i + 1)
-                && (1..=0x1F).contains(&high)
-                && c >= 0x1_0000
-            {
-                let at = u64::from(c) | u64::from(high) << 32;
-                if named(1, at) {
-                    m.ready(at, 1);
-                }
+    for (i, &c) in constants.iter().enumerate() {
+        if let Some(&high) = constants.get(i + 1)
+            && (1..=0x1F).contains(&high)
+            && c >= 0x1_0000
+        {
+            let at = u64::from(c) | u64::from(high) << 32;
+            if named(1, at) {
+                m.ready(at, 1);
             }
-            if builds && (0x0100_0000..0x2000_0000).contains(&c) {
-                let at = u64::from(c) << 8;
-                if named(1, at) {
-                    m.ready(at, 1);
-                }
+        }
+        if builds && (0x0100_0000..0x2000_0000).contains(&c) {
+            let at = u64::from(c) << 8;
+            if named(1, at) {
+                m.ready(at, 1);
             }
         }
     }
     let mut came = [held(m) - before, 0, 0, 0];
-    if prefiltered {
-        for at in fresh_addrs {
-            let before = held(m);
-            match crate::shadow::in_buffer(at, 1) {
-                Some(_) => {
-                    m.ready(at, 1);
-                    m.named_in_upload(at);
-                    came[3] += held(m).saturating_sub(before);
+    for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
+        // (Several structures to a page.)
+        let mut packed = false;
+        if builds
+            && list.first_use(usize::MAX - (3 << 33) - (at >> 8) as usize)
+            && crate::shadow::in_buffer(at, 1).is_none()
+            && m.possible(at / PAGE)
+        {
+            // What it needs, as far as it is known now; the rest when the
+            // list is submitted ([`Memory::land`]).
+            if let Some((len, _)) = m.packed_at(at) {
+                packed = true;
+                for page in at / PAGE..=(at + len - 1) / PAGE {
+                    let new = m.copy_of(page).is_none();
+                    if m.map(page)
+                        && new
+                        && let Some(held) = m.pages.get_mut(&page)
+                    {
+                        held.theirs = true;
+                    }
                 }
-                None => {
-                    m.ready(at, PAGE);
-                    came[2] += held(m).saturating_sub(before);
+                m.bring(at / PAGE, (at + len - 1) / PAGE + 1);
+            }
+            list.defer_host(move || {
+                if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    m.land(at);
                 }
+            });
+            m.bring_up(list);
+        }
+        if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
+            if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
+                && len <= BACK
+                && use_ == (Use::Builds { back: true })
+                && list.first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize)
+            {
+                m.small(list, start, len);
+            }
+            m.opens(at);
+            if !packed && crate::shadow::in_buffer(at, 1).is_none() {
+                #[cfg(feature = "diagnostics")]
+                {
+                    let built = m.dump.built.entry(at).or_insert((frame, frame, 0));
+                    (built.1, built.2) = (frame, built.2 + 1);
+                }
+                let before = held(m);
+                m.ready(at, BUILT);
+                came[1] += held(m).saturating_sub(before);
             }
         }
-    } else {
-        for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
-            // (Several structures to a page.)
-            let mut packed = false;
-            if builds
-                && list.first_use(usize::MAX - (3 << 33) - (at >> 8) as usize)
-                && crate::shadow::in_buffer(at, 1).is_none()
-                && m.possible(at / PAGE)
-            {
-                // What it needs, as far as it is known now; the rest when the
-                // list is submitted ([`Memory::land`]).
-                if let Some((len, _)) = m.packed_at(at) {
-                    packed = true;
-                    for page in at / PAGE..=(at + len - 1) / PAGE {
-                        let new = m.copy_of(page).is_none();
-                        if m.map(page)
-                            && new
-                            && let Some(held) = m.pages.get_mut(&page)
-                        {
-                            held.theirs = true;
-                        }
-                    }
-                    m.bring(at / PAGE, (at + len - 1) / PAGE + 1);
-                }
-                list.defer_host(move || {
-                    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                        m.land(at);
-                    }
-                });
-                m.bring_up(list);
+        if packed || !named(2, at) {
+            continue;
+        }
+        let before = held(m);
+        match crate::shadow::in_buffer(at, 1) {
+            Some(_) => {
+                m.ready(at, 1);
+                m.named_in_upload(at);
+                came[3] += held(m).saturating_sub(before);
             }
-            if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
-                if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
-                    && len <= BACK
-                    && use_ == (Use::Builds { back: true })
-                    && list.first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize)
-                {
-                    m.small(list, start, len);
-                }
-                m.opens(at);
-                if !packed && crate::shadow::in_buffer(at, 1).is_none() {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        let built = m.dump.built.entry(at).or_insert((frame, frame, 0));
-                        (built.1, built.2) = (frame, built.2 + 1);
-                    }
-                    let before = held(m);
-                    m.ready(at, BUILT);
-                    came[1] += held(m).saturating_sub(before);
-                }
-            }
-            if packed || !named(2, at) {
-                continue;
-            }
-            let before = held(m);
-            match crate::shadow::in_buffer(at, 1) {
-                Some(_) => {
-                    m.ready(at, 1);
-                    m.named_in_upload(at);
-                    came[3] += held(m).saturating_sub(before);
-                }
-                None => {
-                    m.ready(at, if builds { VIEW } else { PAGE });
-                    came[2] += held(m).saturating_sub(before);
-                }
+            None => {
+                m.ready(at, if builds { VIEW } else { PAGE });
+                came[2] += held(m).saturating_sub(before);
             }
         }
     }
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
     }
+    let key = std::ptr::from_ref(heap) as usize;
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
         None => {
@@ -1183,32 +1042,15 @@ pub(crate) fn ready(
         let (_, len) = shadow.span();
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
-    let copies_now = m.copies.len();
-    let prev_heap = m.heaps.insert(key, (base, copies_now as u32));
-    if prev_heap != Some((base, copies_now as u32)) {
-        FAST_HEAPS
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert_with(HashMap::new)
-            .insert(key, (base, copies_now as u32));
-    }
-    FAST_COPIES.store(copies_now, Ordering::Release);
-    let dir_gpu = m.directory.1.gpu(m.directory.1.span().0);
-    FAST_FAULTS_GPU.store(m.faults.2, Ordering::Release);
-    FAST_DIR_GPU.store(dir_gpu, Ordering::Release);
+    m.heaps.insert(key, (base, m.copies.len() as u32));
     // Every copy by every list that has come to by-address memory, whoever
     // numbered it: an arena another list made while this one was being
     // recorded was brought up to date by that list's submission alone, which
     // may run after this one's (structures unpacked from zeros, and then
     // written over by the arena's first upload: in frames that stream much in
     // half of them, run light-8).
-    let first_read = if prefiltered { pre_first_read } else { list.first_use(READ) };
-    let need_bring_up = if prefiltered && pre_copies_seen == copies_now {
-        pre_copies_key_new
-    } else {
-        list.first_use(usize::MAX - (6 << 33) - copies_now)
-    };
-    if need_bring_up {
+    let first_read = list.first_use(READ);
+    if list.first_use(usize::MAX - (6 << 33) - m.copies.len()) {
         m.bring_up(list);
     }
     if first_read {
@@ -1220,8 +1062,9 @@ pub(crate) fn ready(
     if use_ == Use::Reads {
         m.dump.walked(addresses);
     }
+    let directory = &m.directory.1;
     Some(Ready {
-        directory: dir_gpu,
+        directory: directory.gpu(directory.span().0),
         faults: m.faults.2,
         base,
     })
@@ -1352,10 +1195,6 @@ mod dump {
     fn folder() -> Option<&'static std::path::PathBuf> {
         static FOLDER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
         FOLDER.get_or_init(|| std::env::var_os("VICTORY_MEMORY_DUMP").map(Into::into)).as_ref()
-    }
-
-    pub(super) fn active() -> bool {
-        folder().is_some()
     }
 
     fn turn(buffer: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {

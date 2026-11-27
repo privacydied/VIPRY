@@ -468,23 +468,3 @@ fn what_landing_costs() {
         busy.store(false, Ordering::Relaxed);
     });
 }
-
-#[test]
-fn lockfree_pool_executes_every_item_across_many_batches() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let pool = Pool::new("test-pool", 6);
-    for round in 0..400usize {
-        let count = (round % 65) + 1;
-        let seen: Vec<AtomicUsize> = (0..count).map(|_| AtomicUsize::new(0)).collect();
-        let sum = AtomicUsize::new(0);
-        pool.each(count, &|i| {
-            let prev = seen[i].fetch_add(1, Ordering::Relaxed);
-            assert_eq!(prev, 0, "round {round} item {i} executed twice");
-            sum.fetch_add(i + 1, Ordering::Relaxed);
-        });
-        assert_eq!(sum.load(Ordering::Relaxed), count * (count + 1) / 2, "round {round}");
-        for (i, s) in seen.iter().enumerate() {
-            assert_eq!(s.load(Ordering::Relaxed), 1, "round {round} item {i} missed");
-        }
-    }
-}

@@ -15,7 +15,7 @@
 //! no earlier one does: the card's side is still written only by the
 //! drawing queue.
 //!
-//! With the sends of `send` (`VICTORY_SEND_OWN`, on by default) the bytes are
+//! With the sends of `send` (`VICTORY_SEND_OWN`) the bytes are
 //! in the submission's own memory in the PC's: that comes up whole, in one
 //! copy, and the sends (copies and pairs of offset and word) read it from our
 //! buffer instead.
@@ -33,12 +33,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 /// Whether it is on now (`VICTORY_UP_QUEUE=1`, or its phase of `VICTORY_AB`).
 pub(super) fn on() -> bool {
-    #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_UP_QUEUE") {
-        return on;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UP_QUEUE").is_some_and(|v| v == "1"))
+    crate::asked_for!("VICTORY_UP_QUEUE")
 }
 
 /// The most bytes one submission sends this way; more go as before.
@@ -149,23 +144,7 @@ pub(super) unsafe fn send(
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
-    // Best-fit slot selection: reuse the smallest free bounce buffer that fits
-    // `total` (avoiding destroying and recreating large VRAM buffers on
-    // `victory-submit` whenever a smaller slot sits at the top of `q.free`).
-    let pick = q
-        .free
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.bounce.as_ref().is_some_and(|b| b.1 >= total))
-        .min_by_key(|(_, s)| s.bounce.as_ref().map_or(u64::MAX, |b| b.1))
-        .or_else(|| {
-            q.free
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, s)| s.bounce.as_ref().map_or(0, |b| b.1))
-        })
-        .map(|(i, _)| i);
-    let Some(mut slot) = pick.map(|i| q.free.swap_remove(i)).or_else(|| make_slot(&host.device)) else {
+    let Some(mut slot) = q.free.pop().or_else(|| make_slot(&host.device)) else {
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
@@ -225,6 +204,33 @@ pub(super) unsafe fn send(
     STATS[1].fetch_add(ranges.iter().map(|r| r.3).sum::<u64>(), Relaxed);
     STATS[2].fetch_add(ranges.len() as u64, Relaxed);
     Some(slot)
+}
+
+/// [`send`] of what `dirty` sends up (the CPU sides of the copies, by range);
+/// `record` gets, for each range, the card side, its offset, our buffer, the
+/// range's offset in it and its bytes.
+///
+/// # Safety
+/// As [`send`].
+pub(super) unsafe fn send_dirty(
+    host: &super::Host,
+    dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+    mut record: impl FnMut((&ID3D12Resource, u64, &ID3D12Resource, u64, u64)),
+) -> Option<Slot> {
+    let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
+    let mut ranges: Vec<Range<'_>> = Vec::new();
+    for ((shadow, rs), side) in dirty.iter().zip(&sides) {
+        if let Some((staging, _, _)) = side {
+            ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
+        }
+    }
+    // SAFETY: the caller's.
+    unsafe {
+        send(host, &host.queue, &ranges, |i, bounce, at| {
+            let (card, offset, _, bytes) = ranges[i];
+            record((card, offset, bounce, at, bytes));
+        })
+    }
 }
 
 /// A plan's slot, back once its submission has run.

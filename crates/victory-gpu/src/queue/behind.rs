@@ -84,8 +84,9 @@ pub(super) trait Work: Send {
     }
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
-    /// Renderer port #7 (`crate::port_journal`): a mark taken when an entry is
-    /// put in the line: the round of the heaps' records begun after that. 0: none.
+    /// A mark taken when an entry that runs is put in the line (by the thread
+    /// that puts it, before the line's lock): the round of the heaps' records
+    /// begun after that (`crate::heap_marks`). 0: none.
     fn mark_now() -> u64 {
         0
     }
@@ -94,8 +95,11 @@ pub(super) trait Work: Send {
     fn mark_later() -> u64 {
         0
     }
-    /// Whether what its queue has behind this wait may have been written only
-    /// just before the wait was met (by the CPU).
+    /// Whether what its queue has behind this wait may have been written
+    /// only just before the wait was met (by the CPU, which writes, then
+    /// meets the wait): it was met in memory. A wait met by a bottom-of-pipe
+    /// write of a flight or of the submission it is taken along with is the
+    /// card's order, not the CPU's.
     fn raises(&self) -> bool {
         true
     }
@@ -127,7 +131,9 @@ struct State<W> {
     /// Presents and submissions in the line or being done.
     presents: usize,
     runs: usize,
-    /// Per queue, the highest [`Work::mark_later`] of the waits it went past.
+    /// Per queue, the highest [`Work::mark_later`] of the waits it went past:
+    /// what is behind a wait may have been written only before the wait was
+    /// met, not before it was put in the line.
     floors: Vec<(usize, u64)>,
 }
 
@@ -293,8 +299,10 @@ impl<W: Work> Lane<W> {
 
     /// The parts of `entry`, which stands for them, in place `at`.
     fn unfold(state: &mut State<W>, at: usize, entry: Entry<W>) {
+        let began = Instant::now();
         let (number, queue, runs, mark) = (entry.number, entry.queue, usize::from(entry.what.runs()), entry.mark);
         let parts = entry.what.unfold();
+        STATS[UNFOLDING].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
         state.runs -= runs;
         state.runs += parts.iter().filter(|p| p.runs()).count();
         for (i, what) in parts.into_iter().enumerate() {
@@ -355,9 +363,11 @@ impl<W: Work> Lane<W> {
             entry
         };
         let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
-        // The highest mark of what it is made of (renderer port #7).
+        // The highest mark of what it is made of (`crate::heap_marks`).
         let mut mark = entry.mark;
         if entry.what.ask().is_some() && !entry.what.folded() && entry.what.raises() {
+            // A wait that goes: what its queue has behind it was written
+            // before it was met, which is now at the latest.
             let later = W::mark_later();
             self.lock().raise(entry.queue, later);
         }
@@ -434,8 +444,9 @@ type Recordings = std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>
 enum Job {
     /// The queue waits for the fence (its address) to reach the value.
     Wait(usize, u64),
-    /// A part of a submission waits for a memory value.
-    Value(crate::list::ValueWait),
+    /// A part of a submission to the queue (its address) waits for a memory
+    /// value.
+    Value(usize, crate::list::ValueWait),
     /// A submission, or a part of one: the lists' host sides and the order
     /// they run in.
     Run(usize, Vec<crate::list::Detached>, Vec<usize>),
@@ -447,8 +458,15 @@ enum Job {
     Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
     /// A signal of the queue's.
     Signal(usize, u64),
-    /// A frame is shown: the texture and the state its lists leave it in.
-    Present(Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>, super::Shown),
+    /// A frame is shown: the base texture (and optional overlay plane) and the states their lists leave them in.
+    Present(
+        Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
+        Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
+        super::Shown,
+        // Its place among the frames in flight (`VICTORY_ASYNC_PRESENT`),
+        // handed on to the flight of the present's copy.
+        Option<std::sync::Arc<super::FrameSlot<'static>>>,
+    ),
 }
 
 // SAFETY: D3D12 objects are free-threaded; a job is touched by whoever put it
@@ -468,7 +486,7 @@ impl Work for Job {
     fn ask(&self) -> Option<Ask> {
         match self {
             &Job::Wait(fence, value) => Some(Ask::Wait(fence, value)),
-            Job::Value(wait) => Some(Ask::Value(*wait)),
+            Job::Value(_, wait) => Some(Ask::Value(*wait)),
             Job::Lists(_, lists) => Some(Ask::Lists(lists.clone())),
             _ => None,
         }
@@ -483,7 +501,7 @@ impl Work for Job {
             return vec![self];
         };
         let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
-        let jobs = jobs_of(queue as This, &lists, true);
+        let jobs = jobs_of(queue as This, &lists);
         // It stood for one submission not begun.
         let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
         QUEUED.fetch_add(runs, Relaxed);
@@ -499,25 +517,28 @@ impl Work for Job {
     }
 
     fn mark_now() -> u64 {
-        if crate::port_journal::on() { crate::descriptor::round_after_now() } else { 0 }
+        if crate::heap_marks::on() { crate::descriptor::round_after_now() } else { 0 }
     }
 
     fn mark_later() -> u64 {
-        if crate::port_journal::on() { crate::descriptor::round_after_now() } else { 0 }
+        // (Asked for now: the round runs while the line does what is before
+        // the part behind the wait.)
+        if crate::heap_marks::on() { crate::descriptor::round_after_now() } else { 0 }
     }
 
     fn raises(&self) -> bool {
-        if !crate::port_journal::on() {
+        // (Without the switch no mark is taken: the memory is not read.)
+        if !crate::heap_marks::on() {
             return true;
         }
         match self {
-            Job::Value(wait) => wait.met(),
+            Job::Value(_, wait) => wait.met(),
             _ => true,
         }
     }
 
     fn marked(&mut self, mark: u64) {
-        crate::port_journal::set_mark(mark);
+        crate::heap_marks::set_mark(mark);
     }
 
     fn met(ask: &Ask) -> bool {
@@ -542,19 +563,23 @@ impl Work for Job {
             return Err(next);
         }
         // Nothing but waits and signals that a submission may follow.
-        let (count, lists, signals) = match self {
-            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..]),
-            Job::Joined(_, lists, order, parts, signals) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
+        let (queue, count, lists, signals) = match self {
+            Job::Run(queue, lists, order) => (*queue, 1, (&*lists, &*order), &[][..]),
+            Job::Joined(queue, lists, order, parts, signals) => (*queue, 1 + parts.len(), (&*lists, &*order), &signals[..]),
             _ => return Err(next),
         };
         let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
         match &next {
-            Job::Value(wait) => {
-                let met = wait.met()
-                    || crate::host::late_met_known(wait) == Some(true)
-                    || hosts().any(|list| crate::host::will_meet(list, wait));
-                if !met {
+            Job::Value(_, wait) => {
+                let met = wait.met();
+                let ahead = !met && crate::host::late_met_known(wait) == Some(true);
+                if !met && !ahead && !hosts().any(|list| crate::host::will_meet(list, wait)) {
                     return Err(next);
+                }
+                // Met by a flight in the air: on a queue of its own the
+                // submission would wait for it.
+                if ahead && crate::host::two_queues::on() && !hosts().any(|list| crate::host::will_meet(list, wait)) {
+                    crate::host::two_queues::value_passed(queue, wait);
                 }
             }
             &Job::Wait(fence, value) => {
@@ -613,27 +638,32 @@ impl Work for Job {
         }
         match self {
             // (A folded one is unfolded, never done.)
-            Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
+            Job::Wait(..) | Job::Lists(..) => {}
+            Job::Value(queue, wait) => {
+                if !forced {
+                    crate::host::two_queues::value_passed(queue, &wait);
+                }
+            }
             Job::Run(queue, lists, order) => {
-                let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || format!("RUN submission of {} lists (its thread's)", order.len()));
-                match crate::host::host() {
+                let after = crate::host::two_queues::take_after(queue);
+                crate::host::two_queues::for_title(super::kind_of(queue), after, || match crate::host::host() {
                     Some(host) => host.execute_late(lists, order),
                     None => drop(lists),
-                }
+                });
                 QUEUED.fetch_sub(1, Relaxed);
             }
             Job::Joined(queue, lists, order, parts, signals) => {
-                let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {
                     format!("RUN {} parts of submissions in one, {} lists (its thread's)", 1 + parts.len(), order.len())
                 });
-                match crate::host::host() {
+                let after = crate::host::two_queues::take_after(queue);
+                crate::host::two_queues::for_title(super::kind_of(queue), after, || match crate::host::host() {
                     Some(host) => host.execute_parts(lists, order, &parts),
                     None => drop(lists),
-                }
+                });
                 // (A part that had no list is one all the same.)
                 QUEUED.fetch_sub(1 + parts.len() as u64, Relaxed);
                 for (fence, value) in signals {
@@ -647,18 +677,22 @@ impl Work for Job {
                     crate::fence::set(fence as This, value);
                 }
             }
-            Job::Present(texture, shown) => {
+            Job::Present(texture, overlay, shown, slot) => {
                 if let Some((texture, state)) = texture {
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
                     let state = if state == u32::MAX { texture.state.load(Relaxed) } else { state };
-                    super::show(&texture.texture, state, shown);
+                    let over = overlay.as_ref().map(|(ov, ov_state)| {
+                        let st = if *ov_state == u32::MAX { ov.state.load(Relaxed) } else { *ov_state };
+                        (&ov.texture, st)
+                    });
+                    super::show_planes(&texture.texture, state, over, shown, slot);
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
         }
         // (The mark was this submission's alone.)
-        crate::port_journal::set_mark(0);
+        crate::heap_marks::set_mark(0);
         STATS[BUSY].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
 }
@@ -673,8 +707,9 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// times they found things in it (the sum of their numbers) and the most; what
 /// threads of the title waited, in microseconds, for room in the line, at a
 /// present, and for a drain, and the drains; what our thread worked; waits
-/// not met at a present.
-static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// not met at a present; parts joined; what our thread spent taking the
+/// lists of submissions whose translation was done out of the line.
+static STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -687,6 +722,9 @@ const BUSY: usize = 8;
 const FORCED: usize = 9;
 /// Parts prepared together with the one before them.
 const JOINED: usize = 10;
+/// Microseconds of [`Lane::unfold`] (the lists detached, new host lists
+/// given to the title's lists), under the line's lock and not in [`BUSY`].
+const UNFOLDING: usize = 11;
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -796,6 +834,7 @@ pub(super) fn drain() {
     if OURS.get() {
         return;
     }
+    let _timed = crate::frame_wait::time(crate::frame_wait::Call::Drain);
     let began = Instant::now();
     LANE.drain();
     STATS[DRAINING].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -817,7 +856,7 @@ pub(super) fn submit(this: This, lists: &[This]) {
         room(before + 1);
         return;
     }
-    let jobs = jobs_of(this, lists, false);
+    let jobs = jobs_of(this, lists);
     let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
     let before = QUEUED.fetch_add(runs, Relaxed);
     STATS[RUNS].fetch_add(runs, Relaxed);
@@ -837,10 +876,8 @@ fn room(queued: u64) {
     }
 }
 
-/// What a submission of `lists` is in the line. With `thin`, `lists` are
-/// single-use backing shells of thin recordings whose `HostList` is taken
-/// without allocating or closing a replacement on `victory-submit`.
-fn jobs_of(this: This, lists: &[This], thin: bool) -> Vec<Job> {
+/// What a submission of `lists` is in the line.
+fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
     let queue = this as usize;
     // In one piece up to the first list that waits for a memory value, as
     // `super::submit_cut` runs them; the rest part by part.
@@ -861,21 +898,12 @@ fn jobs_of(this: This, lists: &[This], thin: bool) -> Vec<Job> {
     });
     let mut jobs: Vec<Job> = Vec::new();
     if first > 0 {
-        let (taken, order) = if thin {
-            crate::list::detach_thin(&lists[..first])
-        } else {
-            crate::list::detach(&lists[..first])
-        };
+        let (taken, order) = crate::list::detach(&lists[..first]);
         jobs.push(Job::Run(queue, taken, order));
     }
     if first < lists.len() {
-        let parts = if thin {
-            crate::list::detach_parts_thin(&lists[first..])
-        } else {
-            crate::list::detach_parts(&lists[first..])
-        };
-        for (waits, taken, order) in parts {
-            jobs.extend(waits.into_iter().map(Job::Value));
+        for (waits, taken, order) in crate::list::detach_parts(&lists[first..]) {
+            jobs.extend(waits.into_iter().map(|wait| Job::Value(queue, wait)));
             jobs.push(Job::Run(queue, taken, order));
         }
     }
@@ -902,10 +930,23 @@ pub(super) fn wait(this: This, fence: This, value: u64) {
 
 /// A present on queue `this` of `texture`, in the state the lists recorded so
 /// far leave it in.
-pub(super) fn present(this: This, texture: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>, shown: super::Shown) {
+pub(super) fn present(
+    this: This,
+    texture: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
+    overlay: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
+    shown: super::Shown,
+    slot: Option<std::sync::Arc<super::FrameSlot<'static>>>,
+) {
     QUEUED.fetch_add(1, Relaxed);
     STATS[PRESENTS].fetch_add(1, Relaxed);
-    LANE.push(this as usize, [Job::Present(texture, shown)]);
+    // With a place among the frames in flight the title is paced by those
+    // (it took the place before this call), not by the line.
+    let paced = slot.is_some();
+    LANE.push(this as usize, [Job::Present(texture, overlay, shown, slot)]);
+    if paced {
+        crate::frame_wait::queued();
+        return;
+    }
     let began = Instant::now();
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());
@@ -918,7 +959,8 @@ pub(super) fn line(frames: f64) {
     let ms = |i: usize| s[i] / 1000.0 / frames;
     tracing::info!(
         "submissions prepared by a thread of ours, per frame (VICTORY_ASYNC_SUBMIT): {:.1} in {:.1} presents, {:.1} in the line \
-         when one was added (at most {:.0}); that thread worked {:.1} ms; threads of the title waited {:.1} ms for room in the \
+         when one was added (at most {:.0}); that thread worked {:.1} ms, and {:.2} ms more taking translated lists out of the \
+         line (under its lock); threads of the title waited {:.1} ms for room in the \
          line, {:.1} ms at presents, {:.1} ms in {:.1} drains; waits not met at a present {:.2}; {:.1} of the \
          submissions were prepared together with the one before them (VICTORY_JOIN_PARTS)",
         s[RUNS] / frames,
@@ -926,6 +968,7 @@ pub(super) fn line(frames: f64) {
         s[DEPTH] / s[RUNS].max(1.0),
         s[DEEPEST],
         ms(BUSY),
+        ms(UNFOLDING),
         ms(ROOM),
         ms(AT_PRESENT),
         ms(DRAINING),
@@ -1016,10 +1059,73 @@ mod tests {
                 }
             }
         }
+        fn mark_now() -> u64 {
+            NOW.get()
+        }
+        fn mark_later() -> u64 {
+            LATER.get()
+        }
+        fn marked(&mut self, mark: u64) {
+            let name = match self {
+                T::Run(name, _) | T::Slow(name, ..) => name.to_string(),
+                T::Group(names, ..) => names.join("+"),
+                _ => "?".into(),
+            };
+            MARKS.with(|m| m.borrow_mut().push((name, mark)));
+        }
     }
 
     thread_local! {
         static FORCED_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// What [`Work::mark_now`] and [`Work::mark_later`] give in a test.
+        static NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static LATER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// The marks submissions were done with, by name.
+        static MARKS: std::cell::RefCell<Vec<(String, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// (Ported from Belobug/VIctory-Belobug-AMD 673be0e.) A submission is
+    /// done with the mark taken when it was put in the line, or, behind a
+    /// wait of its queue, at least the one taken when that wait went (what
+    /// is behind a wait may be written only before it is met); one taken
+    /// along with others, the highest of all.
+    #[test]
+    fn a_submission_needs_what_was_written_before_it_and_its_queues_waits() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let f = fence();
+        let run = |name| T::Run(name, log.clone());
+        NOW.set(5);
+        lane.push(1, [run("a")]);
+        NOW.set(6);
+        lane.push(1, [T::Wait(f, 1), run("b")]);
+        look(&lane);
+        assert_eq!(MARKS.take(), [("a".to_string(), 5)], "b stands at its wait");
+        // The wait is met later; what b reads may have been written just
+        // before that.
+        LATER.set(9);
+        crate::fence::set(f as This, 1);
+        look(&lane);
+        assert_eq!(MARKS.take(), [("b".to_string(), 9)]);
+        // Another queue went past no wait; this one did, for good.
+        NOW.set(7);
+        lane.push(2, [run("c")]);
+        NOW.set(3);
+        lane.push(1, [run("d")]);
+        look(&lane);
+        assert_eq!(MARKS.take(), [("c".to_string(), 7), ("d".to_string(), 9)]);
+        // Taken along: a met wait between two parts raises them both.
+        let part = |name| T::Group(vec![name], log.clone(), Vec::new());
+        NOW.set(10);
+        LATER.set(12);
+        lane.push(3, [part("x"), T::Wait(f, 1), part("y")]);
+        look(&lane);
+        assert_eq!(MARKS.take(), [("x+y".to_string(), 12)]);
+        // A present is no submission: it is told no mark.
+        lane.push(3, [T::Present("present", log.clone())]);
+        look(&lane);
+        assert!(MARKS.take().is_empty());
+        assert_eq!(*log.lock().unwrap(), ["a", "b", "c", "d", "x+y", "present"]);
     }
 
     fn fence() -> usize {

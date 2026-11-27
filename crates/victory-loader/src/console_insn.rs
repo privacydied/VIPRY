@@ -109,8 +109,8 @@ fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
     Some(code)
 }
 
-/// Room for stubs near the title's code: `(base, bytes_used)` per 64 KiB block.
-static STUBS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+/// Room for [`clzero_stub`]s near the title's code: where it is and the bytes used.
+static STUBS: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
 pub(crate) const STUBS_LEN: usize = 64 << 10;
 
 /// Memory for code within reach of a `jmp rel32` at `at`.
@@ -124,36 +124,6 @@ pub(crate) fn near(at: usize) -> Option<usize> {
     })
 }
 
-/// Writes `body` into an executable stub block reachable via `jmp rel32` from `at`.
-///
-/// # Safety
-/// `body` contains self-contained machine code already relocated for the returned stub address;
-/// wait—we pass a closure `build(stub)` so the stub knows its own address before copying.
-unsafe fn alloc_stub(at: usize, max_len: usize, build: impl FnOnce(usize) -> Option<Vec<u8>>) -> Option<usize> {
-    let mut blocks = STUBS.lock().unwrap_or_else(|e| e.into_inner());
-    let slot = blocks
-        .iter()
-        .position(|&(place, used)| used + max_len <= STUBS_LEN && jump(at, place + used).is_some())
-        .or_else(|| {
-            let place = near(at)?;
-            blocks.push((place, 0));
-            Some(blocks.len() - 1)
-        })?;
-    let (place, used) = &mut blocks[slot];
-    let stub = *place + *used;
-    if *used + max_len > STUBS_LEN || jump(at, stub).is_none() {
-        return None;
-    }
-    let body = build(stub)?;
-    if *used + body.len() > STUBS_LEN {
-        return None;
-    }
-    // SAFETY: inside freshly reserved RWX stub memory not yet jumped to.
-    unsafe { std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len()) };
-    *used += body.len().next_multiple_of(16);
-    Some(stub)
-}
-
 /// Replaces the `clzero` loop at `at`, whose 12 bytes are `code`: whether it did.
 ///
 /// No thread is ever inside the loop's other instructions (the emulation does the whole loop
@@ -165,114 +135,25 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     let &[a, b, c, d, e, _, _, x, y, z, 0x72, 0xf4] = code else {
         return false;
     };
-    if (at & 15) + 5 > 16 {
+    let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
+    if stubs.is_none() {
+        *stubs = near(at).map(|place| (place, 0));
+    }
+    let Some((place, used)) = stubs.as_mut() else {
+        return false;
+    };
+    let stub = *place + *used;
+    let (Some(body), Some(jump)) = (clzero_stub(at, stub, [x, y, z]), jump(at, stub)) else {
+        return false;
+    };
+    if *used + body.len() > STUBS_LEN || (at & 15) + 5 > 16 {
         return false;
     }
-    // SAFETY: `alloc_stub` reserves RWX memory within rel32 reach and copies `body`; `patch` atomically updates `[at..at+5]`.
+    // SAFETY: inside the memory made for it, which nothing runs yet; then the title's code.
     unsafe {
-        let Some(stub) = alloc_stub(at, 96, |stub| clzero_stub(at, stub, [x, y, z])) else {
-            return false;
-        };
-        let Some(jmp) = jump(at, stub) else {
-            return false;
-        };
-        patch(at, [a, b, c, d, e], jmp)
-    }
-}
-
-/// Whether immediate SSE4a `extrq` / `insertq` instructions are patched on first fault into
-/// native SSE2/GPR stubs (`VICTORY_PATCH_SSE4A=0` emulates each time, as before).
-fn patches_sse4a() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PATCH_SSE4A").is_none_or(|v| v != "0"))
-}
-
-fn push_movq_to_gpr(code: &mut Vec<u8>, gpr: u8, xmm: u8) {
-    // Legacy SSE2 `66 REX.W 0F 7E /r`: MOVQ r64, xmm (preserves YMM[255:128]).
-    code.extend([0x66, 0x48 | ((xmm >> 3) << 2), 0x0f, 0x7e, 0xc0 | ((xmm & 7) << 3) | (gpr & 7)]);
-}
-
-fn push_movq_from_gpr(code: &mut Vec<u8>, xmm: u8, gpr: u8) {
-    // Legacy SSE2 `66 REX.W 0F 6E /r`: MOVQ xmm, r64 (zeroes XMM[127:64], preserves YMM[255:128]).
-    code.extend([0x66, 0x48 | ((xmm >> 3) << 2), 0x0f, 0x6e, 0xc0 | ((xmm & 7) << 3) | (gpr & 7)]);
-}
-
-fn sse4a_stub(after_rip: usize, stub: usize, what: ConsoleOnly) -> Option<Vec<u8>> {
-    // Prologue: pushfq; push rax; push rcx; push rdx
-    let mut code = vec![0x9c, 0x50, 0x51, 0x52];
-    match what {
-        ConsoleOnly::Extrq { dst, src: None, len, idx } => {
-            let flen = match len & 63 {
-                0 => 64u32,
-                n => u32::from(n),
-            };
-            let fidx = idx & 63;
-            push_movq_to_gpr(&mut code, 0, dst); // rax = xmm(dst).Low
-            if fidx > 0 {
-                code.extend([0x48, 0xc1, 0xe8, fidx]); // shr rax, fidx
-            }
-            if flen < 64 {
-                let ones = (1u64 << flen) - 1;
-                code.extend([0x48, 0xba]); // movabs rdx, ones
-                code.extend_from_slice(&ones.to_le_bytes());
-                code.extend([0x48, 0x21, 0xd0]); // and rax, rdx
-            }
-            push_movq_from_gpr(&mut code, dst, 0); // xmm(dst) = rax (high 64b zeroed)
-        }
-        ConsoleOnly::Insertq { dst, src, reg: false, len, idx } => {
-            let flen = match len & 63 {
-                0 => 64u32,
-                n => u32::from(n),
-            };
-            let fidx = idx & 63;
-            let ones = if flen >= 64 { u64::MAX } else { (1u64 << flen) - 1 };
-            let mask = ones.checked_shl(u32::from(fidx)).unwrap_or(0);
-            push_movq_to_gpr(&mut code, 0, dst); // rax = xmm(dst).Low
-            push_movq_to_gpr(&mut code, 1, src); // rcx = xmm(src).Low
-            if ones != u64::MAX {
-                code.extend([0x48, 0xba]); // movabs rdx, ones
-                code.extend_from_slice(&ones.to_le_bytes());
-                code.extend([0x48, 0x21, 0xd1]); // and rcx, rdx
-            }
-            if fidx > 0 {
-                code.extend([0x48, 0xc1, 0xe1, fidx]); // shl rcx, fidx
-            }
-            code.extend([0x48, 0xba]); // movabs rdx, !mask
-            code.extend_from_slice(&(!mask).to_le_bytes());
-            code.extend([0x48, 0x21, 0xd0]); // and rax, rdx
-            code.extend([0x48, 0x09, 0xc8]); // or rax, rcx
-            push_movq_from_gpr(&mut code, dst, 0); // xmm(dst) = rax (high 64b zeroed)
-        }
-        _ => return None,
-    }
-    // Epilogue: pop rdx; pop rcx; pop rax; popfq; jmp after_rip
-    code.extend([0x5a, 0x59, 0x58, 0x9d]);
-    let end = stub + code.len();
-    code.extend(jump(end, after_rip)?);
-    Some(code)
-}
-
-/// Replaces an immediate SSE4a `extrq`/`insertq` instruction (`len >= 5`) at `at` with a
-/// `jmp rel32` to a native SSE2+GPR stub (padded with NOPs), if it fits inside 16 aligned bytes.
-///
-/// # Safety
-/// `at` is inside mapped title code of at least `code.len()` bytes.
-unsafe fn patch_sse4a(at: usize, code: &[u8], what: ConsoleOnly) -> bool {
-    if code.len() < 5 || (at & 15) + code.len() > 16 {
-        return false;
-    }
-    let after = at + code.len();
-    // SAFETY: `alloc_stub` allocates reachable RWX stub memory; `patch_slice` swaps the instruction atomically.
-    unsafe {
-        let Some(stub) = alloc_stub(at, 96, |stub| sse4a_stub(after, stub, what)) else {
-            return false;
-        };
-        let Some(jmp) = jump(at, stub) else {
-            return false;
-        };
-        let mut repl = vec![0x90u8; code.len()];
-        repl[..5].copy_from_slice(&jmp);
-        patch_slice(at, code, &repl)
+        std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len());
+        *used += body.len().next_multiple_of(16);
+        patch(at, [a, b, c, d, e], jump)
     }
 }
 
@@ -293,21 +174,23 @@ fn with_patch(word: u128, at: usize, patch: &[u8]) -> Option<u128> {
 /// protection for the page's own.
 static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Replaces `was` at `at` with `replacement` in one atomic `cmpxchg16b` store.
+/// Replaces the bytes at `at`, which are `was`, by `patch`, in one store that other threads
+/// see whole: whether they are replaced now (not where they cross 16 aligned bytes, or the page
+/// cannot be written).
 ///
 /// # Safety
-/// `at` is in code that stays mapped, and `replacement` preserves semantics.
-unsafe fn patch_slice(at: usize, was: &[u8], replacement: &[u8]) -> bool {
+/// `at` is in code that stays mapped, and `patch` does for it what `was` does.
+unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if was.len() != replacement.len() || (at & 15) + replacement.len() > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
+    if (at & 15) + N > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
         return false;
     }
     let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
     let word = (at & !15) as *mut u128;
-    let here = (at & 15)..(at & 15) + replacement.len();
+    let here = (at & 15)..(at & 15) + N;
     let mut old = 0u32;
     // SAFETY: the aligned 16 bytes around the instruction lie in one page of mapped code, made
     // writable for the store and put back; the processor has the instruction (asked above).
@@ -319,11 +202,11 @@ unsafe fn patch_slice(at: usize, was: &[u8], replacement: &[u8]) -> bool {
         let mut now = std::arch::x86_64::cmpxchg16b(word, 0, 0, SeqCst, SeqCst);
         let done = loop {
             let bytes = &now.to_le_bytes()[here.clone()];
-            if bytes == replacement {
+            if bytes == patch {
                 // (Another thread's fault at the same place: done already.)
                 break true;
             }
-            let Some(new) = (bytes == was).then(|| with_patch(now, at, replacement)).flatten() else {
+            let Some(new) = (bytes == was).then(|| with_patch(now, at, &patch)).flatten() else {
                 break false;
             };
             let there = std::arch::x86_64::cmpxchg16b(word, now, new, SeqCst, SeqCst);
@@ -336,17 +219,6 @@ unsafe fn patch_slice(at: usize, was: &[u8], replacement: &[u8]) -> bool {
         FlushInstructionCache(GetCurrentProcess(), word.cast(), 16);
         done
     }
-}
-
-/// Replaces the bytes at `at`, which are `was`, by `patch`, in one store that other threads
-/// see whole: whether they are replaced now (not where they cross 16 aligned bytes, or the page
-/// cannot be written).
-///
-/// # Safety
-/// `at` is in code that stays mapped, and `patch` does for it what `was` does.
-unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool {
-    // SAFETY: forwarded from caller's contract.
-    unsafe { patch_slice(at, &was, &patch) }
 }
 
 /// Diagnostics: how often each place in the title's code raises one of these exceptions, the
@@ -625,45 +497,27 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             *regs[r as usize & 15] = cpu;
         }
         // the low quadword changes; the high one is zeroed, as a Zen 5 does
-        ConsoleOnly::Extrq { dst, src, len: flen, idx } => {
-            if src.is_none()
-                && len >= 5
-                && patches_sse4a()
-                // SAFETY: `rip` is mapped title code of `len` bytes.
-                && unsafe { patch_sse4a(rip, &code[..len], what) }
-            {
-                #[cfg(feature = "diagnostics")]
-                sites::patched();
-            }
+        ConsoleOnly::Extrq { dst, src, len, idx } => {
             // SAFETY: the context's XMM registers (CONTEXT_FLOATING_POINT is captured for exceptions).
             let x = unsafe { &mut ctx.Anonymous.FltSave.XmmRegisters };
-            let (flen, idx) = match src {
+            let (len, idx) = match src {
                 Some(s) => {
                     let c = x[s as usize & 15].Low;
                     (c as u8, (c >> 8) as u8)
                 }
-                None => (flen, idx),
+                None => (len, idx),
             };
             let d = &mut x[dst as usize & 15];
-            d.Low = decode::extrq(d.Low, flen, idx);
+            d.Low = decode::extrq(d.Low, len, idx);
             d.High = 0;
         }
-        ConsoleOnly::Insertq { dst, src, reg, len: flen, idx } => {
-            if !reg
-                && len >= 5
-                && patches_sse4a()
-                // SAFETY: `rip` is mapped title code of `len` bytes.
-                && unsafe { patch_sse4a(rip, &code[..len], what) }
-            {
-                #[cfg(feature = "diagnostics")]
-                sites::patched();
-            }
+        ConsoleOnly::Insertq { dst, src, reg, len, idx } => {
             // SAFETY: as above.
             let x = unsafe { &mut ctx.Anonymous.FltSave.XmmRegisters };
             let s = x[src as usize & 15];
-            let (flen, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (flen, idx) };
+            let (len, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (len, idx) };
             let d = &mut x[dst as usize & 15];
-            d.Low = decode::insertq(d.Low, s.Low, flen, idx);
+            d.Low = decode::insertq(d.Low, s.Low, len, idx);
             d.High = 0;
         }
     }
@@ -795,72 +649,5 @@ mod tests {
         }
         assert!(clzero_stub(0x1000, 0x2000, [0x48, 0x39, 0xc0]).is_none(), "against rax itself");
         assert!(jump(0x1000, 0x9000_0000_0000).is_none(), "out of reach");
-    }
-
-    #[test]
-    fn sse4a_immediate_instructions_become_native_stubs() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
-        // Cases: insertq xmm0,xmm1,16,16; insertq xmm8,xmm7,24,0; insertq xmm0,xmm0,8,24; extrq xmm2,4,8
-        let cases: &[(&[u8], u8, u8, u64, u64, u64)] = &[
-            (&[0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10], 0, 1, 0x1122_3344_5566_7788, 0x0000_0000_abcd_ef01, decode::insertq(0x1122_3344_5566_7788, 0xabcd_ef01, 16, 16)),
-            (&[0xf2, 0x44, 0x0f, 0x78, 0xc7, 0x18, 0x00], 8, 7, 0xaabb_ccdd_eeff_0011, 0x0000_0000_0012_3456, decode::insertq(0xaabb_ccdd_eeff_0011, 0x0012_3456, 24, 0)),
-            (&[0xf2, 0x0f, 0x78, 0xc0, 0x08, 0x18], 0, 0, 0x1122_3344_5566_7788, 0x1122_3344_5566_7788, decode::insertq(0x1122_3344_5566_7788, 0x1122_3344_5566_7788, 8, 24)),
-            (&[0x66, 0x0f, 0x78, 0xc2, 0x04, 0x08], 2, 2, 0xdead_beef_cafe_babe, 0, decode::extrq(0xdead_beef_cafe_babe, 4, 8)),
-        ];
-        // SAFETY: self-contained RWX page exercising native stub execution via Win64 ABI.
-        unsafe {
-            let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
-            assert_ne!(page, 0);
-            for (idx, &(insn, dst, src, dst_v, src_v, want)) in cases.iter().enumerate() {
-                let mut gprs = [0x1111_2222_3333_4444u64, 0x5555_6666_7777_8888, 0x9999_aaaa_bbbb_cccc, 0];
-                let mut xmms = [[dst_v, 0xffff_ffff_ffff_ffffu64], [src_v, 0x1234_5678_9abc_def0u64]];
-                let off = 48;
-                let patch_at = page + 256 * idx + off;
-                let (what, len) = decode::decode(insn).unwrap();
-                assert_eq!(len, insn.len());
-                std::ptr::copy_nonoverlapping(insn.as_ptr(), patch_at as *mut u8, insn.len());
-                assert!(patch_sse4a(patch_at, insn, what));
-                assert_eq!(*(patch_at as *const u8), 0xe9);
-                // Build harness at page + 256 * idx: (rcx = xmms, rdx = gprs)
-                let entry = page + 256 * idx;
-                let mut h = Vec::new();
-                // movdqu xmm(dst), [rcx]; movdqu xmm(src), [rcx+16] (via rax/r8)
-                h.extend([0x49, 0x89, 0xd0]); // mov r8, rdx (r8 = gprs)
-                let load_xmm = |code: &mut Vec<u8>, reg: u8, disp: u8| {
-                    code.extend([0xf3, 0x0f | ((reg >> 3) << 2) * 0, 0]); // unused placeholder removed below
-                    let _ = (reg, disp);
-                };
-                let _ = load_xmm;
-                // Keep harness simple: push rax/rcx/rdx? Use r9=rcx, r8=rdx, load GPRs from r8, run patch_at, store back
-                h.clear();
-                h.extend([0x49, 0x89, 0xc9, 0x49, 0x89, 0xd0]); // mov r9, rcx; mov r8, rdx
-                // movdqu xmm(dst), [r9]; movdqu xmm(src), [r9+16] (if src != dst)
-                let rex_d = 0x41 | ((dst >> 3) << 2);
-                h.extend([0xf3, rex_d, 0x0f, 0x6f, 0x01 | ((dst & 7) << 3)]);
-                if src != dst {
-                    let rex_s = 0x41 | ((src >> 3) << 2);
-                    h.extend([0xf3, rex_s, 0x0f, 0x6f, 0x41 | ((src & 7) << 3), 16]);
-                }
-                h.extend([0x49, 0x8b, 0x00, 0x49, 0x8b, 0x48, 8, 0x49, 0x8b, 0x50, 16]); // mov rax,[r8]; mov rcx,[r8+8]; mov rdx,[r8+16]
-                h.extend([0x49, 0x3b, 0x00]); // cmp rax, [r8] -> sets ZF=1, CF=0, PF=1
-                assert!(h.len() <= off);
-                while h.len() < off { h.push(0x90); }
-                std::ptr::copy_nonoverlapping(h.as_ptr(), entry as *mut u8, h.len());
-                let tail_at = patch_at + insn.len();
-                let mut t = Vec::new();
-                // Save flags + rax,rcx,rdx into gprs[0..4], store xmm(dst) into xmms[0]
-                t.extend([0x49, 0x89, 0x00, 0x49, 0x89, 0x48, 8, 0x49, 0x89, 0x50, 16]); // mov [r8],rax; [r8+8],rcx; [r8+16],rdx
-                t.extend([0x9c, 0x58, 0x49, 0x89, 0x40, 24]); // pushfq; pop rax; mov [r8+24], rax
-                t.extend([0xf3, rex_d, 0x0f, 0x7f, 0x01 | ((dst & 7) << 3), 0xc3]); // movdqu [r9], xmm(dst); ret
-                std::ptr::copy_nonoverlapping(t.as_ptr(), tail_at as *mut u8, t.len());
-                let run: extern "C" fn(*mut [u64; 2], *mut u64) = std::mem::transmute(entry);
-                run(xmms.as_mut_ptr(), gprs.as_mut_ptr());
-                assert_eq!(xmms[0][0], want, "case {idx} low mismatch");
-                assert_eq!(xmms[0][1], 0, "case {idx} high qword must be zeroed");
-                assert_eq!((gprs[0], gprs[1], gprs[2]), (0x1111_2222_3333_4444, 0x5555_6666_7777_8888, 0x9999_aaaa_bbbb_cccc));
-                assert_ne!(gprs[3] & 0x40, 0, "ZF must remain preserved");
-            }
-            VirtualFree(page as *mut _, 0, MEM_RELEASE);
-        }
     }
 }

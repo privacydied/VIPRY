@@ -24,7 +24,6 @@ victory-pipeline = { path = "crates/victory-pipeline" }
 victory-game = { path = "crates/victory-game" }
 
 # External crates
-mimalloc = { version = "0.1", default-features = false }
 anyhow = "1.0.104"
 thiserror = "2.0.21"
 clap = { version = "4.6.9", features = ["derive"] }
@@ -72,7 +71,6 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
-lto = "thin"
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),

@@ -27,9 +27,11 @@ We are not at the goal yet. Measured on the target machine (below), in the world
   delete it.
 - About 600 draws a frame are dropped while their pipelines compile. The
   pipeline cache is fixed (it now saves under Proton), and pipelines can be
-  built ahead with `victory warm`.
+  built ahead with `victory warm`. On `vipry-next`, `VICTORY_PIPELINE_STANDINS=1`
+  (from Kelvaroq, not yet measured) draws them with a built look-alike pipeline.
 - 22 compute shaders do not translate, because NVIDIA cards run 32 lanes and
-  these shaders need 64.
+  these shaders need 64. On `vipry-next`, `VICTORY_WAVE64_PAIRED=1` (from
+  Kelvaroq, not yet measured) runs them with two console lanes in each lane.
 - Some pipeline worker threads die of a stack overflow. Those pipelines are
   never made.
 - Plans and measurements: [docs/RECONCILE.md](docs/RECONCILE.md).
@@ -57,8 +59,98 @@ The `main` branch is the merge Proudnoob4 posted in fxceless/victory-fork#1268
 
 Single commits we take from other forks name the source commit and its author.
 Forks audited for code to take: Belobug, DexNom, myokex,
-[stellarr-studio/kelvaroq](https://github.com/stellarr-studio/kelvaroq) and
-VItoriaBr (see [docs/RECONCILE.md](docs/RECONCILE.md)).
+[stellarr-studio/kelvaroq](https://github.com/stellarr-studio/kelvaroq),
+[brothernog/rota](https://github.com/brothernog/rota) and VItoriaBr (see [docs/RECONCILE.md](docs/RECONCILE.md)).
+
+## Taken onto `vipry-next` from other forks
+
+Code taken after the move to trustno1's current `main`. Each commit names its
+source and author. None of it is measured in the title yet: the release build
+passes, and the unit tests under Wine fail only the tests that fail on the base
+too (tests that need a real GPU are skipped or fail there in the same way).
+Every new switch is **off** unless the table says otherwise.
+
+**Single commits**
+
+| Commit | From | What |
+|---|---|---|
+| `9425df50` | fxceless (PR #1210) | A view moved to the first level with memory keeps the title's minimum level |
+| `8fb1aed2` | fxceless | CI: the gpu crate's tests run one at a time |
+| `3d6fa92c` | cccw (#1320) | Lists a split submission runs at once give their descriptor table slots back |
+| `2eac15c9` | fxceless | `VICTORY_DUMP_REFUSED=<dir>` saves a shader that does not translate, for offline work |
+| `cc2d1656` | rota (nog) | Skip the depth-bounds test on the software adapter |
+| `20701aa0` | rota (nog) | Tiled cascade shadows translate exactly on 32-lane cards (the same fix as Belobug `4fd34fd`) |
+| `20834d4b` | rota (nog) | `VICTORY_DYNAMIC_SLOTS` on a capped view heap |
+| `d8efddc9` | rota (nog) | HLE test: adding a user never waits for a picker |
+| `5a8d8097` | rota (nog) | GPU time stamps only in the timing mode |
+| `225d4531` | rota (nullrv) | Pipeline warm-up records kept per adapter (this PC has two 3090s) |
+| `2eabed07` | rota (nog) | `VICTORY_LIBRARY_PREFETCH=1` reads the mapped pipeline library at once |
+
+**Ported by hand** (the code did not apply; it was re-fitted to our tree)
+
+| Switch | From | What |
+|---|---|---|
+| `VICTORY_RT_MISS=1` | rota `7f18c7b1`, `a291870d` | Every ray is a miss, and the ray-only compute programs (skinning, about 1,000 hit-shading programs, probe ray activation, tracing) are left out. Upstream: +0.3 to +0.8 fps. `VICTORY_RT_SKIN`, `VICTORY_RT_RESOLVE`, `VICTORY_ACTIVATE_RAYS`, `VICTORY_RT_TRACE` keep one kind |
+| `VICTORY_HEAP_WORKER=1` | rota `d15ae120`, `1654bf2b` | The texture pass's rechecks run on a thread of ours, off the frame thread |
+| `VICTORY_LEAN_MATH=<bits>` | rota `52c6d16a` (from AntoninMichelq/VIctory-forkAMD) | Cheaper host forms of console float math; differs only at NaN, a zero's sign, or one rounding |
+| `VICTORY_WAVE64_PAIRED=1` | Kelvaroq patch 0052 | A 64-lane program that no 32-lane form takes runs with two console lanes in each host lane |
+| `VICTORY_PIPELINE_STANDINS=1` | Kelvaroq patch 0050 | While a pipeline is built, its draws use a built pipeline with the same shaders and compatible state, instead of being dropped |
+| `VICTORY_PIPELINE_WARMUP=1` | Kelvaroq patch 0050 | Saves the exact pipeline recipes and builds them, most used first, at the next start |
+| `VICTORY_WATCH_RESERVATION=1` | Kelvaroq patch 0045 | One write-watch query per memory reservation per submission. Wine gives no region information, so under Proton it falls back to the old path |
+| `VICTORY_ASYNC_PRESENT=1` | Kelvaroq patch 0046 | Present returns with up to `VICTORY_FRAMES_AHEAD` (2) frames in flight; needs `VICTORY_ASYNC_SUBMIT=1`. Kelvaroq's 0048 turns it on by default; we keep it off |
+| `VICTORY_MESH_LAUNCH=1` | Kelvaroq patch 0041 | Indirect mesh draws are launched by an amplification stage of ours instead of a clamp pass between two full waits. Upstream: heavy frame 198 to 120 ms, mostly GPU time. Kelvaroq ships it on; we keep it off until it is tested on the 3090 |
+
+**Settings from rota's README** (no code; `linux/vipry-next.env` does not have
+them yet): `VICTORY_THIN=0` (rota: `THIN=1` more than halves the frame rate on
+NVIDIA, and our first `vipry-next` run had it on), `VICTORY_CARD_STEPS=1`,
+`VICTORY_CARD_ALL=1`, `VICTORY_MEMORY_CARD_MB=1024`, `VICTORY_MEMORY_MAP=0`,
+`VICTORY_DYNAMIC_SLOTS=499999`, `VICTORY_PIPELINE_WORKERS=6`, then
+`victory warm --used` after one run with `VICTORY_PIPELINE_BOOK=1`.
+
+**Cherry-picked from Belobug** (`Belobug/VIctory-Belobug-AMD`, branch
+`a-publier`; the original authors are kept on each commit, and each message
+names its source hash)
+
+| Commit | What | Switch (off by default) |
+|---|---|---|
+| `4822935e` | One barrier per card buffer after its copies, not one per copy | none |
+| `f1e5a111`, `2a9e3b38`, `495ee3bd` | Output size and render scale | `VICTORY_OUTPUT`, `VICTORY_DISPLAY_MODE`, `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`, `VICTORY_FFX_SCALE` |
+| `bb0427d9` | Shaders: one interpolation mode per signature row | none |
+| `ce857ce5` | Shaders: a live set's registers walked a bit at a time | none |
+| `8e04404b` | Memory log by category | `VICTORY_MEMORY_CATEGORIES` |
+| `20814448` | Card and system memory segments sampled apart | none |
+| `5f05b5e6` | Trace of where pipeline workers spend time | diagnostics build only |
+| `02b398d6` | Shaders: a level query of a 2D array takes no slice (3 shaders the validator refused) | none |
+| `63b67f03` | Host sampler heaps get 2,048 slots, slot 2,047 a null sentinel | none |
+| `3510720f` | Timing runs: the card's time by kind of list | `VICTORY_GPU_TIMING` |
+| `09d548f9` | Write-watch asks leave out the kernel's reset; only found pages are reset (part of `122d3546`) | `VICTORY_ASK_NORESET` |
+
+**Not taken from Belobug**
+
+- `6d172c4` (per-heap texture pass) and `c83e54c` (ahead ranges found by
+  halving): `vipry-next` already does the same, a different way.
+- `11511b8` (texture queue without its lock, and four more changes in one
+  commit), `2f5aa98` (HUD memory labels, built on a panel we do not have),
+  `b4ba4bb` (ambient settle), `85a663d` (two planes): conflict in many places.
+- `abbbd6b`, `7348b80`, `7bf91de`, `368293e`: each needs Belobug shader
+  commits that are not in our tree.
+- `122d354`'s meter thread and `VICTORY_ASK_SPREAD`, `f36a0fc`, `8a0700a`
+  (XMA voice refill): not taken yet.
+
+**Not taken**
+
+- rota `9eb26275` (small buffers on the card) and `TEXTURE_DROP_MIPS`: they
+  help 8-12 GB cards; a 24 GB card already gets these limits. rota `5e5aaf9a`
+  (half views): needs rota's 16-bit view work.
+- Kelvaroq 0044 (in-place copies) and 0059 (pipeline precompile): we have
+  trustno1's versions. 0058 (CLZERO): the 3700X has the instruction. 0062 and
+  0063 (start of the shared-memory layer): built on Windows memory sections,
+  high risk under Wine, and the full layer is not public. 0049 and 0060: many
+  small fixes, taken only if we meet the same bug. 0041's wide hash: we already
+  hash with a group of 64 threads.
+- Kelvaroq says patches from 0049 on rebuild ideas from XCL
+  (github.com/ivall/xcl, GPL-2.0-only). The code we took is Kelvaroq's own,
+  under GPL-3.0; no code from XCL itself is in this repository.
 
 ## Target machine
 
@@ -134,6 +226,11 @@ commits taken from elsewhere name the commit and its author.
   every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
   reads into title memory.
 - **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
+- **[brothernog/rota](https://github.com/brothernog/rota)** (nog, nullrv,
+  edsuuu's VI-BR-PORT before it): the commits and ports listed above.
+- **[stellarr-studio/kelvaroq](https://github.com/stellarr-studio/kelvaroq)**:
+  patches 0041, 0045, 0046, 0050 and 0052.
+- **cccw**: pull request #1320.
 
 ## License
 

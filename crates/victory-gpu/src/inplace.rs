@@ -167,6 +167,14 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// Something placed elsewhere (`crate::port`) in the same form: counted as
+/// [`place_for`] counts, so that [`gone`] takes it off again.
+pub(crate) fn counted(window: bool, bytes: u64) {
+    let at = if window { 0 } else { 2 };
+    STATS[at].fetch_add(1, Ordering::Relaxed);
+    STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
@@ -181,9 +189,8 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
-    // A region of the constants heap over it shows the pages the title had
-    // there, not those it maps now: the next ask opens the memory anew.
-    constants_forget(at as u64, len as u64);
+    // Renderer port 1's regions there: no longer what the title shows.
+    crate::port::forget(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -207,203 +214,6 @@ fn say() {
         s[1] >> 20,
         s[2],
         s[3] >> 20,
-        s[4],
-        s[5],
-        s[6],
-        s[7]
-    );
-}
-
-// The title's constants heap in place (`VICTORY_INPLACE_CONSTANTS`, ported from fxceless@bcc54215).
-
-/// `VICTORY_INPLACE_CONSTANTS`: 0 (unset) off; 1 on.
-pub(crate) fn constants_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match mode_of(std::env::var("VICTORY_INPLACE_CONSTANTS").ok().as_deref()) {
-        1 => {
-            tracing::info!("the constants heap is read and written by the card in place (VICTORY_INPLACE_CONSTANTS=1)");
-            true
-        }
-        2 => {
-            tracing::warn!(
-                "VICTORY_INPLACE_CONSTANTS=alt turned down: a title buffer cannot change form while the title runs (descriptor slots keep the copy \
-                 they were made with); the constants heap stays a copy. Compare a launch with =1 against one without, at equal draws"
-            );
-            false
-        }
-        _ => false,
-    })
-}
-
-fn mode_of(value: Option<&str>) -> u8 {
-    match value.map(str::trim) {
-        Some("1") => 1,
-        Some("alt") => 2,
-        _ => 0,
-    }
-}
-
-fn constants_min() -> u64 {
-    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MIN.get_or_init(|| {
-        std::env::var("VICTORY_INPLACE_CONSTANTS_MIN_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(64)
-            << 20
-    })
-}
-
-const LOW: u64 = 1 << 32;
-
-struct Region {
-    start: u64,
-    end: u64,
-    heap: ID3D12Heap,
-}
-
-static REGIONS: std::sync::Mutex<Vec<Region>> = std::sync::Mutex::new(Vec::new());
-static ALIVE: AtomicU64 = AtomicU64::new(0);
-static CSTATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-
-/// Whether `[start, start + len)` is big enough and low enough to be the
-/// constants heap and one run of a section; `Err` says how the title's
-/// views cover it when it is big and low enough but not one run.
-fn constants_wanted(start: u64, len: u64, min: u64) -> Result<bool, String> {
-    if len < min.max(1) || !start.checked_add(len).is_some_and(|end| end <= LOW) {
-        return Ok(false);
-    }
-    match cover(start as usize, len as usize) {
-        Cover::Run(..) => Ok(true),
-        how => Err(format!("not one run of a section: {how:?}")),
-    }
-}
-
-pub(crate) fn pages_of_range(start: u64, len: u64) -> (u64, u64) {
-    (start & !(K64 as u64 - 1), (start + len.max(1)).next_multiple_of(K64 as u64))
-}
-
-pub(crate) fn place_constants(start: u64, len: u64, fresh: bool) -> Option<Placed> {
-    if !constants_on() {
-        return None;
-    }
-    let host = crate::host::host()?;
-    match constants_place(&host.device, start, len, constants_min(), fresh) {
-        Ok(Some(placed)) => {
-            STATS[2].fetch_add(1, Ordering::Relaxed);
-            STATS[3].fetch_add(len, Ordering::Relaxed);
-            CSTATS[2].fetch_add(1, Ordering::Relaxed);
-            Some(placed)
-        }
-        Ok(None) => None,
-        Err((stat, why)) => {
-            if CSTATS[stat].fetch_add(1, Ordering::Relaxed) < 8 {
-                tracing::warn!(start = format_args!("{start:#x}"), len, why, "the constants heap not in place: a copy as before (VICTORY_INPLACE_CONSTANTS)");
-            }
-            None
-        }
-    }
-}
-
-fn constants_place(device: &ID3D12Device, start: u64, len: u64, min: u64, fresh: bool) -> Result<Option<Placed>, (usize, String)> {
-    let (at, end) = pages_of_range(start, len);
-    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
-    let i = match regions.iter().position(|r| r.start <= at && end <= r.end) {
-        Some(i) => i,
-        None => {
-            match constants_wanted(at, end - at, min) {
-                Ok(true) => {}
-                Ok(false) => return Ok(None),
-                Err(why) => return Err((3, why)),
-            }
-            if !fresh {
-                return Err((6, "a title buffer in its pages has a copy already".to_owned()));
-            }
-            let region = constants_open(device, at, end)?;
-            CSTATS[0].fetch_add(1, Ordering::Relaxed);
-            CSTATS[1].fetch_add(end - at, Ordering::Relaxed);
-            tracing::info!(
-                start = format_args!("{at:#x}"),
-                bytes = end - at,
-                "a title buffer of the constants heap in place: the card reads and writes the title's pages through a view of ours (VICTORY_INPLACE_CONSTANTS)"
-            );
-            regions.push(region);
-            ALIVE.store(regions.len() as u64, Ordering::Relaxed);
-            regions.len() - 1
-        }
-    };
-    let region = &regions[i];
-    let buffer = place(device, &region.heap, at - region.start, end - at).map_err(|e| (5, format!("no buffer placed in the region: {e}")))?;
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Some(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at }))
-}
-
-fn constants_open(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
-    let bytes = (end - at) as usize;
-    let Cover::Run(section, offset) = cover(at as usize, bytes) else {
-        return Err((3, format!("not one run of a section: {:?}", cover(at as usize, bytes))));
-    };
-    if !offset.is_multiple_of(K64 as u64) {
-        return Err((3, format!("the run starts at {offset:#x} of its section")));
-    }
-    // SAFETY: the section of a view the title has; the range lies in the run.
-    let view = unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes) }.Value;
-    if view.is_null() {
-        return Err((4, format!("no view of ours: {}", std::io::Error::last_os_error())));
-    }
-    let unmap = || {
-        // SAFETY: our own view, nothing opened on it.
-        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view }) };
-    };
-    // SAFETY: inside our own view.
-    if unsafe { mem::VirtualAlloc(view, bytes, mem::MEM_COMMIT, mem::PAGE_READWRITE) }.is_null() {
-        let error = std::io::Error::last_os_error();
-        unmap();
-        return Err((4, format!("the view of ours not committed: {error}")));
-    }
-    match open(device, From::Part(view as usize, bytes)) {
-        Ok(heap) => Ok(Region { start: at, end, heap }),
-        Err(e) => {
-            unmap();
-            Err((5, format!("refused by the host: {e}")))
-        }
-    }
-}
-
-fn constants_forget(at: u64, len: u64) {
-    if ALIVE.load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    let end = at.saturating_add(len);
-    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
-    let before = regions.len();
-    regions.retain(|r| r.end <= at || r.start >= end);
-    ALIVE.store(regions.len() as u64, Ordering::Relaxed);
-    CSTATS[7].fetch_add((before - regions.len()) as u64, Ordering::Relaxed);
-}
-
-fn constants_say() {
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = crate::host::now_ms();
-    let last = LAST.load(Ordering::Relaxed);
-    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
-        return;
-    }
-    let s: Vec<u64> = CSTATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
-    let (alive, bytes) = {
-        let regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
-        (regions.len(), regions.iter().map(|r| r.end - r.start).sum::<u64>())
-    };
-    tracing::info!(
-        "the constants heap in place (VICTORY_INPLACE_CONSTANTS=1): {alive} regions {} MB (opened so far {}, {} MB), {} title buffers placed in them so far \
-         (no copy, no refresh, nothing sent up, hashed, compared or fetched for them); turned down: {} not one run of a section, {} no view of ours, \
-         {} refused by the host, {} a title buffer in its pages had a copy already; {} regions forgotten because the title mapped other pages there",
-        bytes >> 20,
-        s[0],
-        s[1] >> 20,
-        s[2],
-        s[3],
         s[4],
         s[5],
         s[6],
@@ -474,10 +284,10 @@ struct Views {
     /// Of those, how many are shown more than once.
     pages_twice: usize,
     /// Sections by handle: bytes, and whether made committed.
-    sections: BTreeMap<usize, (u64, bool)>,
+    sections: Vec<(usize, u64, bool)>,
     /// Our own view of a whole section, by its handle (0: the host gave
     /// none), made when first asked for ([`beside`]) and kept.
-    whole: BTreeMap<usize, usize>,
+    whole: Vec<(usize, usize)>,
 }
 
 /// Read by many threads at once (write faults, landings), changed when the
@@ -486,8 +296,8 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     views: BTreeMap::new(),
     pages: BTreeMap::new(),
     pages_twice: 0,
-    sections: BTreeMap::new(),
-    whole: BTreeMap::new(),
+    sections: Vec::new(),
+    whole: Vec::new(),
 });
 
 fn views() -> std::sync::RwLockReadGuard<'static, Views> {
@@ -502,10 +312,11 @@ fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views_mut();
+    v.sections.retain(|s| s.0 != section);
     // A handle's number given out again: the view was of the section that
     // had it before (it stays mapped: someone may be writing through it).
-    v.whole.remove(&section);
-    v.sections.insert(section, (bytes, committed));
+    v.whole.retain(|w| w.0 != section);
+    v.sections.push((section, bytes, committed));
 }
 
 /// The runtime lets go of a section, and of its handle: no view the title
@@ -513,8 +324,8 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 pub fn title_memory_section_gone(section: usize) {
     let whole = {
         let mut v = views_mut();
-        v.sections.remove(&section);
-        v.whole.remove(&section)
+        let at = v.whole.iter().position(|w| w.0 == section);
+        at.map(|i| v.whole.swap_remove(i).1)
     };
     if let Some(base) = whole.filter(|&base| base != 0) {
         // SAFETY: a view of ours. Who writes through it found the section
@@ -724,6 +535,40 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
 }
 
+/// The whole stretch of views around `[at, at + len)` that follow one
+/// another in memory and in one section alike, if the range is one run of a
+/// section ([`Cover::Run`]): its first address, its bytes, the section and
+/// the offset of its first byte in it.
+pub(crate) fn stretch(at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+    let v = views();
+    stretch_in(&v.views, at, len)
+}
+
+fn stretch_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+    let Cover::Run(section, offset) = cover_in(views, at, len) else {
+        return None;
+    };
+    // Every view of the stretch has the same address less section offset.
+    let delta = at as i128 - offset as i128;
+    let follows = |a: usize, s: usize, o: u64| s == section && a as i128 - o as i128 == delta;
+    let (&first, &(n, _, _)) = views.range(..=at).next_back()?;
+    let mut start = first;
+    for (&a, &(n, s, o)) in views.range(..first).rev() {
+        if a + n != start || !follows(a, s, o) {
+            break;
+        }
+        start = a;
+    }
+    let mut stop = first + n;
+    for (&a, &(n, s, o)) in views.range(first + 1..) {
+        if a != stop || !follows(a, s, o) {
+            break;
+        }
+        stop = a + n;
+    }
+    Some((start, stop - start, section, (start as i128 - delta) as u64))
+}
+
 /// Another address of the title memory `[at, at + len)`, if it is a view of
 /// the title's pages, all of it one run of a section: in a view of ours of
 /// the whole section, which is never guarded (`crate::watch`) nor changed.
@@ -738,7 +583,7 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
         let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
             return None;
         };
-        v.whole.get(&section).map(|&base| (base, offset))
+        v.whole.iter().find(|w| w.0 == section).map(|w| (w.1, offset))
     };
     if let Some((base, offset)) = known {
         return (base != 0).then(|| base + offset as usize);
@@ -747,17 +592,17 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
     let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
         return None;
     };
-    let base = match v.whole.get(&section) {
-        Some(&base) => base,
+    let base = match v.whole.iter().find(|w| w.0 == section) {
+        Some(w) => w.1,
         None => {
-            let &(bytes, _) = v.sections.get(&section)?;
+            let &(_, bytes, _) = v.sections.iter().find(|s| s.0 == section)?;
             // SAFETY: the whole of a section the runtime made; a view the
             // title sees is of it, so its handle is open.
             let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize;
             if base == 0 {
                 tracing::warn!(error = %std::io::Error::last_os_error(), "no view of the title's pages beside its own");
             }
-            v.whole.insert(section, base);
+            v.whole.push((section, base));
             base
         }
     };
@@ -778,11 +623,11 @@ pub(crate) fn beside_page(page: usize) -> Option<(usize, [usize; 8])> {
                 return None;
             }
             let offset = offset + within as u64;
-            if let Some(&whole) = v.whole.get(&section) {
+            if let Some(whole) = v.whole.iter().find(|w| w.0 == section) {
                 let mut shown = [0; 8];
                 let all = v.pages.get(&(section, offset))?;
                 shown.get_mut(..all.len())?.copy_from_slice(all);
-                return (whole != 0).then(|| (whole + offset as usize, shown));
+                return (whole.1 != 0).then(|| (whole.1 + offset as usize, shown));
             }
         }
         if asked || beside(page, K64).is_none() {
@@ -818,7 +663,7 @@ fn hr<T>(result: &windows::core::Result<T>) -> String {
 
 /// A queue, a list and a fence of the probe's own on `device`: nothing of
 /// the host's submissions is touched.
-struct Rig {
+pub(crate) struct Rig {
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
@@ -838,7 +683,7 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
+    pub(crate) fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
         // SAFETY: plain creation of objects of our own.
         unsafe {
             let queue: ID3D12CommandQueue =
@@ -883,7 +728,7 @@ impl Rig {
     }
 
     /// What the GPU reads of `size` bytes of `resource` from `offset`.
-    fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
+    pub(crate) fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
         let back = self.committed(D3D12_HEAP_TYPE_READBACK, size as u64, D3D12_RESOURCE_STATE_COPY_DEST)?;
         // SAFETY: two live buffers, the range inside both.
         self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) })?;
@@ -898,7 +743,7 @@ impl Rig {
     }
 
     /// The GPU writes `bytes` at `offset` of `resource` (a copy).
-    fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
+    pub(crate) fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
         let up = self.committed(D3D12_HEAP_TYPE_UPLOAD, bytes.len() as u64, D3D12_RESOURCE_STATE_GENERIC_READ)?;
         let mut data = std::ptr::null_mut();
         // SAFETY: the mapping holds the buffer's bytes until unmapped.
@@ -1344,13 +1189,9 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    let mut groups = BTreeMap::new();
-    for &section in v.sections.values() {
-        *groups.entry(section).or_insert(0usize) += 1;
-    }
-    for ((bytes, committed), count) in groups {
+    for &(_, bytes, committed) in &v.sections {
         lines.push(format!(
-            "census, {count} sections of {} MB each, {}",
+            "census, a section of {} MB, {}",
             bytes >> 20,
             if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
         ));
@@ -1425,9 +1266,6 @@ pub(crate) fn tick() {
     if level() > 0 {
         say();
     }
-    if constants_on() {
-        constants_say();
-    }
     if probe_level() == 0 {
         return;
     }
@@ -1472,7 +1310,7 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Views as the runtime tells them: a range inside one view, or over
@@ -1523,6 +1361,28 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    /// The stretch around a run: views on both sides that follow in memory
+    /// and in the section, up to a view from elsewhere or a gap.
+    #[test]
+    fn a_stretch_is_the_views_around_a_run_that_follow_in_the_section() {
+        let mut views = BTreeMap::new();
+        let at = 0x7_2000_0000usize;
+        // From elsewhere in the section, just below.
+        views.insert(at - K64, (K64, 9, 40 * K64 as u64));
+        for (k, n) in [(0usize, 2usize), (2, 3), (5, 1)] {
+            views.insert(at + k * K64, (n * K64, 9, ((10 + k) * K64) as u64));
+        }
+        // Next in memory, of another section; then a gap.
+        views.insert(at + 6 * K64, (K64, 8, 16 * K64 as u64));
+        views.insert(at + 8 * K64, (K64, 9, 18 * K64 as u64));
+        let whole = Some((at, 6 * K64, 9, 10 * K64 as u64));
+        assert_eq!(stretch_in(&views, at + 3 * K64 + 5, 10), whole);
+        assert_eq!(stretch_in(&views, at, 6 * K64), whole);
+        assert_eq!(stretch_in(&views, at + 5 * K64, 2 * K64), None, "into the other section");
+        assert_eq!(stretch_in(&views, at + 6 * K64, K64), Some((at + 6 * K64, K64, 8, 16 * K64 as u64)));
+        assert_eq!(stretch_in(&views, at + 7 * K64, K64), None, "the gap");
     }
 
     /// What the runtime forgets when memory is mapped anew.
@@ -1641,17 +1501,6 @@ mod tests {
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
-    }
-
-    /// `VICTORY_INPLACE_CONSTANTS`' values (`alt`, 2, is turned down by `constants_on`).
-    #[test]
-    fn the_constants_switch_reads_off_on_and_alt() {
-        assert_eq!(mode_of(None), 0);
-        assert_eq!(mode_of(Some("0")), 0);
-        assert_eq!(mode_of(Some("1")), 1);
-        assert_eq!(mode_of(Some(" 1 ")), 1);
-        assert_eq!(mode_of(Some("alt")), 2);
-        assert_eq!(mode_of(Some("yes")), 0);
     }
 
     /// The census names each kind of memory.

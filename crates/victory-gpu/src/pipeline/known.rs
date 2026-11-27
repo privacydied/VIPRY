@@ -31,8 +31,12 @@ use windows::core::PCSTR;
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
+mod writer;
+
 const SHADERS: &str = "known-shaders.bin";
 const PIPELINES: &str = "known-pipelines.bin";
+/// Compiler crashes and hangs recorded by `victory warm`.
+pub const WARM_BAD_FILE: &str = "warm-bad.txt";
 /// Stages by their number in the files.
 const STAGES: [&str; 8] =
     ["vertex", "pixel", "domain", "hull", "geometry", "compute", "amplification", "mesh"];
@@ -52,9 +56,14 @@ struct Book {
     added: usize,
 }
 
-static BOOK: OnceLock<Option<Mutex<Book>>> = OnceLock::new();
+struct Recorder {
+    book: Mutex<Book>,
+    writer: writer::Writer,
+}
 
-fn book() -> Option<&'static Mutex<Book>> {
+static BOOK: OnceLock<Option<Recorder>> = OnceLock::new();
+
+fn book() -> Option<&'static Recorder> {
     BOOK.get_or_init(|| {
         let dir = super::library::folder().filter(|_| on())?;
         std::fs::create_dir_all(&dir).ok()?;
@@ -75,26 +84,22 @@ fn book() -> Option<&'static Mutex<Book>> {
             }
         }
         tracing::info!(pipelines = keys.len(), shaders = shaders.len(), "title pipelines known from earlier runs");
-        let spawned = std::thread::Builder::new().name("victory-known".into()).spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                flush();
-            }
-        });
-        spawned.ok()?;
-        Some(Mutex::new(Book { dir, keys, shaders, new: Default::default(), added: 0 }))
+        Some(Recorder {
+            writer: writer::Writer::start(flush).ok()?,
+            book: Mutex::new(Book { dir, keys, shaders, new: Default::default(), added: 0 }),
+        })
     })
     .as_ref()
 }
 
 /// The title created a pipeline.
 pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) {
-    let Some(book) = book() else { return };
+    let Some(recorder) = book() else { return };
     let mut id = [0u8; 16];
     for (at, b) in id.iter_mut().enumerate() {
         *b = key.get(2 * at..2 * at + 2).and_then(|x| u8::from_str_radix(x, 16).ok()).unwrap_or(0);
     }
-    let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+    let mut book = recorder.book.lock().unwrap_or_else(|e| e.into_inner());
     if shaders.is_empty() || !book.keys.insert(id) {
         return;
     }
@@ -122,28 +127,74 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     book.added += 1;
 }
 
-/// Writes what was noted.
-fn flush() {
-    let Some(Some(book)) = BOOK.get() else { return };
-    let (dir, new, added) = {
+/// Appends pipelines noted since the last successful write, if the book is active.
+pub fn flush() {
+    let Some(Some(recorder)) = BOOK.get() else { return };
+    flush_book(&recorder.book);
+}
+
+/// Gives the existing writer a short chance to save after the fatal GPU report.
+pub fn flush_on_gpu_failure() {
+    if let Some(Some(recorder)) = BOOK.get() {
+        recorder.writer.request_flush(std::time::Duration::from_millis(250));
+    }
+}
+
+fn flush_book(book: &Mutex<Book>) {
+    // The timer and shutdown may both flush. Keep their writes in order while
+    // allowing the title to note more pipelines during disk I/O.
+    static WRITER: Mutex<()> = Mutex::new(());
+    let _writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, mut new, added) = {
         let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
         if book.added == 0 {
             return;
         }
         (book.dir.clone(), std::mem::take(&mut book.new), std::mem::take(&mut book.added))
     };
-    for (file, bytes) in [SHADERS, PIPELINES].iter().zip(&new) {
+    for (file, bytes) in [SHADERS, PIPELINES].into_iter().zip(&mut new) {
+        if bytes.is_empty() {
+            continue;
+        }
         let written = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join(file))
-            .and_then(|mut f| f.write_all(bytes));
+            .and_then(|f| append_bytes(f, bytes));
         if let Err(e) = written {
-            tracing::warn!(error = %e, file, "title pipelines not written down");
+            let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+            for (mut older, newer) in new.into_iter().zip(&mut book.new) {
+                if !older.is_empty() {
+                    older.append(newer);
+                    *newer = older;
+                }
+            }
+            book.added += added;
+            drop(book);
+            tracing::warn!(error = %e, file, "keeping unwritten title pipelines for retry");
             return;
         }
     }
     tracing::info!(pipelines = added, "title pipelines written down");
+}
+
+/// A failed append may already have written a prefix of a record.
+fn append_bytes(mut out: impl Write, bytes: &mut Vec<u8>) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let mut written = 0;
+    let result = loop {
+        if written == bytes.len() {
+            break Ok(());
+        }
+        match out.write(&bytes[written..]) {
+            Ok(0) => break Err(Error::from(ErrorKind::WriteZero)),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => break Err(e),
+        }
+    };
+    bytes.drain(..written);
+    result
 }
 
 /// Calls `f` with each container's stage, hash, place and length; where the
@@ -198,14 +249,95 @@ pub fn keys(dir: &Path) -> Vec<String> {
 }
 
 /// What a driver's cached pipelines depend on besides the title's: the
-/// translator with its settings, and the driver.
+/// translator with its settings, the driver, and the card it caches them for
+/// (two cards can share one driver and not its cache).
 pub fn fingerprint() -> String {
+    let host = crate::host::host();
+    fingerprint_of(
+        &crate::shader_cache::translation(),
+        host.as_ref().map(|h| h.driver()),
+        host.as_ref().and_then(|h| h.adapter_id()),
+    )
+}
+
+fn fingerprint_of(translation: &[u8], driver: Option<i64>, adapter: Option<[u32; 4]>) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(&crate::shader_cache::translation());
-    if let Some(host) = crate::host::host() {
-        h.update(&host.driver().to_le_bytes());
+    h.update(translation);
+    if let Some(driver) = driver {
+        h.update(&driver.to_le_bytes());
+    }
+    if let Some(adapter) = adapter {
+        for id in adapter {
+            h.update(&id.to_le_bytes());
+        }
     }
     h.finalize().to_hex()[..16].to_owned()
+}
+
+/// The card's vendor and device, as `vendor:device` in hex (for a log line).
+pub fn adapter() -> Option<String> {
+    let [vendor, device, ..] = crate::host::host()?.adapter_id()?;
+    Some(format!("{vendor:04x}:{device:04x}"))
+}
+
+/// Whether `warm-bad.txt` is ignored (`VICTORY_WARM_BAD=0`).
+pub fn bad_list_disabled() -> bool {
+    std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0")
+}
+
+fn is_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Formats a `warm-bad.txt` entry with the pipeline key in column one (so
+/// older binaries still quarantine the key) and a tagged fingerprint so
+/// driver or translator updates retry it automatically.
+pub fn format_bad_entry(key: &str, fingerprint: &str, reason: &str) -> String {
+    if reason.is_empty() {
+        format!("{key} fp={fingerprint}")
+    } else {
+        format!("{key} fp={fingerprint} {reason}")
+    }
+}
+
+/// Pipeline keys from `warm-bad.txt` that apply to `fingerprint`.
+///
+/// Blank lines and `#` comments are ignored. Entries tagged with a
+/// fingerprint (`<key> fp=<16-hex-fingerprint> ...`, or
+/// `<16-hex-fingerprint> <32-hex-key> ...`) apply only when their
+/// fingerprint matches `fingerprint`, so a driver or translator update
+/// automatically retries them. Legacy or manually added bare-key lines
+/// (`<key> ...`) continue to apply regardless of fingerprint.
+pub fn parse_bad_keys(text: &str, fingerprint: &str) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(first) = parts.next() else {
+            continue;
+        };
+        if let Some(second) = parts.next() {
+            if let Some(fp) = second.strip_prefix("fp=")
+                && is_hex(fp, 16)
+            {
+                if fp == fingerprint {
+                    keys.insert(first.to_owned());
+                }
+                continue;
+            }
+            if is_hex(first, 16) && is_hex(second, 32) {
+                if first == fingerprint {
+                    keys.insert(second.to_owned());
+                }
+                continue;
+            }
+        }
+        keys.insert(first.to_owned());
+    }
+    keys
 }
 
 /// The translations of earlier runs are in `dir` (the pipeline library is
@@ -420,6 +552,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_open_retries_before_later_records() {
+        for blocked in [SHADERS, PIPELINES] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            let book = Mutex::new(Book {
+                dir: dir.into(),
+                keys: HashSet::new(),
+                shaders: HashSet::new(),
+                new: [vec![1], vec![11]],
+                added: 1,
+            });
+            std::fs::create_dir(dir.join(blocked)).unwrap();
+            flush_book(&book);
+            std::fs::remove_dir(dir.join(blocked)).unwrap();
+            {
+                let mut b = book.lock().unwrap();
+                assert_eq!(b.added, 1);
+                b.new[0].push(2);
+                b.new[1].push(12);
+                b.added += 1;
+            }
+            flush_book(&book);
+            flush_book(&book);
+            assert_eq!(std::fs::read(dir.join(SHADERS)).unwrap(), [1, 2]);
+            assert_eq!(std::fs::read(dir.join(PIPELINES)).unwrap(), [11, 12]);
+            assert_eq!(book.lock().unwrap().added, 0);
+        }
+    }
+
+    #[test]
+    fn a_short_write_keeps_only_the_unwritten_suffix() {
+        let mut pending = vec![1, 2, 3, 4, 5];
+        let mut first = [0; 2];
+        // A fixed-size output accepts the prefix, then returns Ok(0).
+        let err = append_bytes(&mut first[..], &mut pending).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(first, [1, 2]);
+        assert_eq!(pending, [3, 4, 5]);
+        let mut rest = Vec::new();
+        append_bytes(&mut rest, &mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(rest, [3, 4, 5]);
+    }
+
+    #[test]
     fn a_state_comes_back_as_it_was() {
         let mut g = GraphicsState { sample_mask: 7, depth_bounds: true, ..Default::default() };
         g.rasterizer.DepthBias = -3;
@@ -452,6 +629,21 @@ mod tests {
         assert!(GraphicsState::get(&bytes[..9]).is_none());
     }
 
+    /// A pipeline made for one card is not taken as made for another on the
+    /// same driver.
+    #[test]
+    fn the_fingerprint_tells_cards_apart() {
+        let card = Some([0x10de, 0x2489, 0x1, 0xa1]);
+        let of = |driver, adapter| fingerprint_of(b"translator", driver, adapter);
+        assert_eq!(of(Some(7), card), of(Some(7), card));
+        assert_ne!(of(Some(7), card), of(Some(7), Some([0x10de, 0x1f08, 0x1, 0xa1])));
+        assert_ne!(of(Some(7), card), of(Some(7), Some([0x10de, 0x2489, 0x1, 0xa2])));
+        assert_ne!(of(Some(7), card), of(Some(8), card));
+        assert_ne!(of(Some(7), card), fingerprint_of(b"another", Some(7), card));
+        assert_eq!(of(None, None), of(None, None));
+        assert_eq!(of(None, None).len(), 16);
+    }
+
     #[test]
     fn a_torn_end_is_not_read() {
         let dir = std::env::temp_dir().join(format!("victory-known-{}", std::process::id()));
@@ -476,5 +668,69 @@ mod tests {
         assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
         assert_eq!(seen, [(5, 9, 37, 4)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_keys_expire_with_fingerprint_and_skip_comments() {
+        let k_stale = "a".repeat(32);
+        let k_warm = "b".repeat(32);
+        let k_no_reason = "c".repeat(32);
+        let k_tab = "d".repeat(32);
+        let k_fp_first = "e".repeat(32);
+        let k_legacy = "f".repeat(32);
+        let k_bare = "1".repeat(32);
+        let k_bad_tag = "2".repeat(32);
+
+        let warm_line = format_bad_entry(&k_warm, "8899aabbccddeeff", "hung for 180 s");
+        assert_eq!(warm_line.split(' ').next(), Some(k_warm.as_str()));
+        let stale_line = format_bad_entry(&k_stale, "0011223344556677", "exit code: 0xc0000005");
+        let no_reason_line = format_bad_entry(&k_no_reason, "8899aabbccddeeff", "");
+        assert_eq!(no_reason_line, format!("{k_no_reason} fp=8899aabbccddeeff"));
+
+        let text = format!(
+            "\n   \n# comment\n   # indented comment\n\
+             {stale_line}\n\
+             {warm_line}\n\
+             {no_reason_line}\n\
+             \t{k_tab}\tfp=8899aabbccddeeff\tended the compiler\n\
+             8899aabbccddeeff {k_fp_first} legacy fp-first\n\
+             {k_legacy} legacy crash\n\
+             {k_bare}\n\
+             manual-skip-key reason\n\
+             {k_bad_tag} fp=nothex reason\n"
+        );
+
+        assert_eq!(
+            parse_bad_keys(&text, "8899aabbccddeeff"),
+            HashSet::from([
+                k_warm,
+                k_no_reason,
+                k_tab,
+                k_fp_first,
+                k_legacy.clone(),
+                k_bare.clone(),
+                "manual-skip-key".to_owned(),
+                k_bad_tag.clone(),
+            ])
+        );
+        assert_eq!(
+            parse_bad_keys(&text, "0011223344556677"),
+            HashSet::from([
+                k_stale,
+                k_legacy.clone(),
+                k_bare.clone(),
+                "manual-skip-key".to_owned(),
+                k_bad_tag.clone(),
+            ])
+        );
+        assert_eq!(
+            parse_bad_keys(&text, "ffffffffffffffff"),
+            HashSet::from([
+                k_legacy,
+                k_bare,
+                "manual-skip-key".to_owned(),
+                k_bad_tag,
+            ])
+        );
     }
 }

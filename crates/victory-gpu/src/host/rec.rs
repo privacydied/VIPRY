@@ -20,12 +20,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 /// Whether barriers are held now (`VICTORY_JOIN_BARRIERS=1`, or its phase
 /// of `VICTORY_AB`).
 pub(crate) fn on() -> bool {
-    #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_JOIN_BARRIERS") {
-        return on;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_BARRIERS").is_some_and(|v| v == "1"))
+    crate::asked_for!("VICTORY_JOIN_BARRIERS")
 }
 
 /// Barriers held. Their resources are borrowed: the list's states hold the

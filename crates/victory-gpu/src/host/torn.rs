@@ -142,13 +142,6 @@ impl Check {
         self.found[i].store(if self::hash(bytes) == hash { 1 } else { 2 }, Ordering::Relaxed);
     }
 
-    /// Whether piece `i` (after [`Check::look`]) did not match the hash its
-    /// flight ended with (torn by a concurrent flight or upload) and must not
-    /// be merged into title memory.
-    pub(super) fn is_torn(&self, i: usize) -> bool {
-        self.found[self.within[i]].load(Ordering::Relaxed) == 2
-    }
-
     /// All is landed: what was found is kept for later flights.
     pub(super) fn done(&self, suspects: &mut Suspects) {
         for ((piece, _), found) in self.of.iter().zip(&self.found) {

@@ -119,18 +119,8 @@ unsafe impl Send for Memory {}
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
-/// Scaled down when free physical RAM is low so idle upload buffers do not
-/// contribute to system commit pressure.
 fn kept() -> u64 {
-    if on_card() {
-        return 256 << 20;
-    }
-    const GIB: u64 = 1024 * 1024 * 1024;
-    match crate::host::available_physical_ram() {
-        Some(avail) if avail < 4 * GIB => 256 << 20,
-        Some(avail) if avail < 8 * GIB => 384 << 20,
-        _ => 768 << 20,
-    }
+    if on_card() { 256 << 20 } else { 768 << 20 }
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -148,16 +138,9 @@ fn on_card() -> bool {
 fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        // Smallest fit, preferring most-recently-used (higher index) on ties
-        // so active buffers stay hot while stale startup buffers age out at index 0.
-        let fit = spare
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.size >= size)
-            .min_by_key(|&(i, m)| (m.size, std::cmp::Reverse(i)))
-            .map(|(i, _)| i);
+        let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
         if let Some(i) = fit {
-            return Some(spare.remove(i));
+            return Some(spare.swap_remove(i));
         }
     }
     // By doubles, so that the next of about this size finds it: what
@@ -176,25 +159,13 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     })
 }
 
-/// The submission has run. Keeps buffers in MRU order and evicts the oldest
-/// unused buffers (LRU) off-thread so `victory-relay` never stalls on WDDM
-/// `ID3D12Resource::Release()` and active 32-64 MiB buffers never thrash.
+/// The submission has run.
 pub(super) fn give_back(memory: Memory) {
-    let limit = kept();
-    let evicted = {
-        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        spare.push(memory);
-        let mut total: u64 = spare.iter().map(|m| m.size).sum();
-        let mut evicted = Vec::new();
-        while total > limit && !spare.is_empty() {
-            let old = spare.remove(0);
-            total -= old.size;
-            evicted.push(old);
-        }
-        evicted
-    };
-    if !evicted.is_empty() {
-        crate::host::drop_async(evicted);
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    spare.push(memory);
+    spare.sort_by_key(|m| std::cmp::Reverse(m.size));
+    while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
+        spare.remove(0);
     }
 }
 
@@ -221,7 +192,7 @@ pub(super) struct Own {
 const RUNS_AT_A_TIME: usize = 4096;
 
 /// Takes what `dirty` sends up out of the CPU sides.
-pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, std::sync::Arc<Vec<(usize, usize)>>)]) -> Option<Own> {
+pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
     // Runs of whole words of the copy: only those are pairs. (A byte beside
@@ -229,100 +200,57 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, std::sync::Arc
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    // Single pass over each dirty shadow's ranges to partition long runs vs short
-    // word-scatter chunks (avoiding 3 separate scans over 50k+ ranges).
-    let mut pending_work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    for (shadow, ranges) in dirty {
+    for (_, ranges) in dirty {
         let mut runs = Vec::new();
-        let mut total_words = 0usize;
-        let from = shadow.card_data() as usize;
-        let mut chunk_words: Vec<(&[(usize, usize)], usize)> = Vec::new();
-        for chunk in ranges.chunks(RUNS_AT_A_TIME) {
-            let mut words = 0usize;
-            for &(a, b) in chunk {
-                if short(&(a, b)) {
-                    words += (b - a) / 4;
-                } else {
-                    runs.push((a, at, b - a));
-                    at += ((b - a) as u64).next_multiple_of(16);
-                }
-            }
-            if words > 0 {
-                chunk_words.push((chunk, words));
-                total_words += words;
-            }
+        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
+            runs.push((a, at, b - a));
+            at += ((b - a) as u64).next_multiple_of(16);
         }
-        let pairs_at = at;
-        let mut pair_off = pairs_at as usize;
-        for (chunk, words) in chunk_words {
-            pending_work.push((from, chunk, pair_off));
-            pair_off += words * 8;
-        }
-        copies.push(Copy { runs, pairs: (pairs_at, total_words as u32) });
-        at += (total_words as u64 * 8).next_multiple_of(16);
+        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+        copies.push(Copy { runs, pairs: (at, words as u32) });
+        at += (words as u64 * 8).next_multiple_of(16);
     }
     if at == 0 {
         return None;
     }
     let memory = memory(host, at)?;
-    const MOVE_CHUNK: usize = 256 << 10;
-    let mut move_chunks: Vec<(usize, usize, usize)> = Vec::new();
-    let mut total_move_bytes = 0u64;
-    let mut total_move_runs = 0u64;
-    for ((shadow, _), copy) in dirty.iter().zip(&copies) {
+    let mut moves: Vec<(usize, usize, usize)> = Vec::new();
+    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
+    for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
-        total_move_runs += copy.runs.len() as u64;
-        for &(a, to, n) in &copy.runs {
-            total_move_bytes += n as u64;
-            let mut off = 0;
-            while off < n {
-                let part = MOVE_CHUNK.min(n - off);
-                move_chunks.push((from + a + off, memory.data + to as usize + off, part));
-                off += part;
+        moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
+        // (80,000 runs of some words a frame: in pieces of work.)
+        let mut to = memory.data + copy.pairs.0 as usize;
+        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
+            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+            if words > 0 {
+                work.push((from, ranges, to));
+                to += words * 8;
             }
         }
     }
-    let work: Vec<(usize, &[(usize, usize)], usize)> = pending_work
-        .into_iter()
-        .map(|(from, chunk, off)| (from, chunk, memory.data + off))
-        .collect();
-    let work_len = work.len();
-    let total_tasks = work_len + move_chunks.len();
-    // Run BOTH scatter-pair packing and write-combined upload memcpys in one
-    // parallel `each_under` pass (eliminating the second thread-pool barrier
-    // and single-threaded <4 MiB WC upload bottleneck).
     let one = |i: usize| {
-        if i < work_len {
-            let _span = crate::timeline::span("under: scatter pairs packed");
-            let (from, ranges, to) = work[i];
-            let mut to = to as *mut [u32; 2];
-            for &(a, b) in ranges.iter().filter(|r| short(r)) {
-                for offset in (a..b).step_by(4) {
-                    // SAFETY: inside the copy's mapping (its CPU side, which
-                    // the thread that asked, and waits, alone writes in these
-                    // ranges) and inside the memory, which has room for every
-                    // pair, a piece of work's behind the last one's.
-                    unsafe {
-                        let word = ((from + offset) as *const u32).read_unaligned();
-                        to.write([offset as u32, word]);
-                        to = to.add(1);
-                    }
+        let (from, ranges, to) = work[i];
+        let mut to = to as *mut [u32; 2];
+        for &(a, b) in ranges.iter().filter(|r| short(r)) {
+            for offset in (a..b).step_by(4) {
+                // SAFETY: inside the copy's mapping (its CPU side, which
+                // the thread that asked, and waits, alone writes in these
+                // ranges) and inside the memory, which has room for every
+                // pair, a piece of work's behind the last one's.
+                unsafe {
+                    let word = ((from + offset) as *const u32).read_unaligned();
+                    to.write([offset as u32, word]);
+                    to = to.add(1);
                 }
             }
-        } else {
-            let (src, dst, len) = move_chunks[i - work_len];
-            // SAFETY: disjoint ranges inside CPU side and submission upload buffer.
-            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
         }
     };
-    if total_tasks > 1 {
-        crate::land::each_under(total_tasks, &one);
-    } else if total_tasks == 1 {
-        one(0);
-    }
-    STATS[0].fetch_add(total_move_bytes, Ordering::Relaxed);
-    STATS[1].fetch_add(total_move_runs, Ordering::Relaxed);
+    crate::land::each_under(work.len(), &one);
+    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
+    STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
+    crate::shadow::copy_all(moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies, used: at })
 }
@@ -330,8 +258,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, std::sync::Arc
 impl Own {
     /// Records the sends into `list`; the copies that `looked` says are in
     /// `COPY_DEST`, the others in the common state. Those with a "before" are
-    /// left readable by compute shaders. Returns the ending D3D12 state of each
-    /// entry in `dirty` (`None` if left in `COMMON`).
+    /// left readable by compute shaders.
     ///
     /// # Safety
     /// An open list of ours, whose compute state is set anew behind this.
@@ -339,17 +266,16 @@ impl Own {
         &self,
         host: &Host,
         list: &ID3D12GraphicsCommandList,
-        dirty: &[(std::sync::Arc<Shadow>, std::sync::Arc<Vec<(usize, usize)>>)],
+        dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
         looked: impl Fn(&Shadow) -> bool,
         from: Option<&ID3D12Resource>,
-    ) -> Vec<Option<D3D12_RESOURCE_STATES>> {
+    ) {
         // (With `crate::host::upq`: a copy of the memory in the card's.)
         let source = from.unwrap_or(&self.memory.buffer);
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
         let (mut first, mut last) = (Vec::new(), Vec::new());
-        let mut states = Vec::with_capacity(dirty.len());
         for ((shadow, _), copy) in dirty.iter().zip(&self.copies) {
             for &(a, from, n) in &copy.runs {
                 // SAFETY: the caller's; live buffers, ranges inside them.
@@ -368,9 +294,7 @@ impl Own {
                 && (!copy.runs.is_empty() || copy.pairs.1 > 0)
             {
                 last.push(transition(&shadow.buffer, was, read));
-                state = Some(read);
             }
-            states.push(state);
         }
         // SAFETY: the caller's; live objects.
         unsafe {
@@ -401,7 +325,6 @@ impl Own {
                 list.ResourceBarrier(&last);
             }
         }
-        states
     }
 
     /// The memory and the bytes of it used.

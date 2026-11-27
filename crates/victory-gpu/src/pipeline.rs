@@ -130,6 +130,7 @@ pub(crate) struct Translated {
     /// A compute program's threads in a group.
     pub(crate) threads: Option<[u32; 3]>,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) tables: crate::draw::TablePlan,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
@@ -147,7 +148,10 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = {
+                    let _translation = crate::timeline::span("pipeline: translate a shader");
+                    translate(&self.container)
+                };
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -171,12 +175,21 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        // `VICTORY_DUMP_REFUSED=<dir>`: the container as the title gave it,
+                        // `<hash>.cdxil`, for offline work (`victory translate <dir>`).
+                        if let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED") {
+                            let dir = std::path::PathBuf::from(dir);
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(dir.join(format!("{}.cdxil", self.hash)), &self.container[..]);
+                        }
+                    }
                 }
                 done.ok()
             })
@@ -222,10 +235,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
     Ok(Translated {
         host,
         threads,
         used,
+        tables,
         stores,
         stores_by_address,
         picks: Default::default(),
@@ -288,6 +303,138 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     c.part(FourCC::DXIL)
         .and_then(|part| victory_shader::native_programs(part.data).ok())
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+}
+
+/// A program name (or the start of one) looked for inside a container: its
+/// first three bytes, its length and the FNV-1a 64 hash of its bytes. The
+/// title's program names are its content, so the source holds only these.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct Named {
+    pub lead: [u8; 3],
+    pub len: usize,
+    pub hash: u64,
+}
+
+#[cfg(windows)]
+impl Named {
+    /// From the name itself (tests, with names of their own).
+    #[cfg(test)]
+    pub(crate) const fn of(name: &[u8]) -> Named {
+        Named { lead: [name[0], name[1], name[2]], len: name.len(), hash: fnv1a(name) }
+    }
+
+    fn is_in(&self, bytes: &[u8]) -> bool {
+        bytes.windows(self.len).any(|w| w[..3] == self.lead && fnv1a(w) == self.hash)
+    }
+}
+
+#[cfg(windows)]
+pub(crate) const fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        h = (h ^ bytes[i] as u64).wrapping_mul(0x100_0000_01b3);
+        i += 1;
+    }
+    h
+}
+
+/// The first of `names` (in their order) found anywhere in `bytes`.
+#[cfg(windows)]
+pub(crate) fn find_named(bytes: &[u8], names: &[Named]) -> Option<usize> {
+    names.iter().position(|n| n.is_in(bytes))
+}
+
+#[cfg(windows)]
+#[test]
+fn names_are_found_by_hash() {
+    assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c); // the published FNV-1a 64 vector
+    let names = [Named::of(b"XS_Second"), Named::of(b"XS_First_")];
+    assert_eq!(find_named(b"..\0XS_First_0011_ff00f5de\0..", &names), Some(1));
+    assert_eq!(find_named(b"XS_Second XS_First_", &names), Some(0));
+    assert_eq!(find_named(b"XS_Secon", &names), None);
+    assert_eq!(find_named(b"", &names), None);
+}
+
+/// What a compute container does only for the ray-tracing structures, by
+/// its entry point's name (kept as hashes: the names are the title's). With
+/// every ray a miss (`VICTORY_RT_MISS=1`) and the structure builder off,
+/// nothing reads what these write:
+/// - `Skin`: 30 programs that pose every animated mesh (and its motion) once
+///   more, only for the structures; they were the largest share of the
+///   card's time in a cutscene (~6 ms a dispatch, hundreds a frame). The
+///   picture's own skinning programs and the cloth's have other names.
+/// - `Resolve`: some 1,000 programs that shade what a ray hit.
+/// - `Activate`: picks the screen probes that cast rays.
+/// - `Trace`: the tracing itself against the structures, and the hair's
+///   geometry made for them. The tracing programs' fallback forms march
+///   through the title's voxels instead and light the picture, so they run.
+///
+/// The last two after codec-d/cool_fox `make.rs` (GPL-3.0-or-later).
+#[cfg(windows)]
+fn for_rays(bytes: &[u8]) -> RayOnly {
+    const NAMES: [Named; 8] = [
+        Named { lead: *b"CSC", len: 17, hash: 0x75d5_4989_f655_36c7 },
+        Named { lead: *b"CSG", len: 16, hash: 0x88d5_868b_21ac_f0a8 },
+        Named { lead: *b"CS_", len: 20, hash: 0x6854_1240_ea05_c84a },
+        Named { lead: *b"CS_", len: 28, hash: 0x4a10_5f92_c2a3_8ecc },
+        Named { lead: *b"CS_", len: 25, hash: 0x1e6f_daa9_5ff4_fecc },
+        Named { lead: *b"_BV", len: 4, hash: 0x2f04_bb42_f945_4ada },
+        Named { lead: *b"CS_", len: 18, hash: 0x5e61_2445_d69c_1403 },
+        Named { lead: *b"Vox", len: 6, hash: 0x215e_0fd8_d761_edac },
+    ];
+    let has = |i: usize| NAMES[i].is_in(bytes);
+    if has(0) || has(1) {
+        RayOnly::Skin
+    } else if has(2) {
+        RayOnly::Resolve
+    } else if has(3) {
+        RayOnly::Activate
+    } else if (has(4) && has(5)) || (has(6) && !has(7)) {
+        RayOnly::Trace
+    } else {
+        RayOnly::No
+    }
+}
+
+/// What a compute pipeline does only for rays ([`for_rays`]).
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RayOnly {
+    No,
+    Skin,
+    Resolve,
+    Activate,
+    Trace,
+}
+
+/// Whether a dispatch of `this` is left out because it only serves rays,
+/// and nothing they could hit is there: every ray is a miss
+/// (`VICTORY_RT_MISS=1`) and the structure builder is off. Each kind runs
+/// anyway with its switch: `VICTORY_RT_SKIN=1`, `VICTORY_RT_RESOLVE=1`,
+/// `VICTORY_RT_TRACE=1`, `VICTORY_ACTIVATE_RAYS=1`.
+#[cfg(windows)]
+pub(crate) fn skips_rt_skin(this: This) -> bool {
+    fn off(switch: &str) -> bool {
+        victory_shader::emit::rt_miss()
+            && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+            && std::env::var_os(switch).is_none_or(|v| v != "1")
+    }
+    static SKIN: OnceLock<bool> = OnceLock::new();
+    static RESOLVE: OnceLock<bool> = OnceLock::new();
+    static ACTIVATE: OnceLock<bool> = OnceLock::new();
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    if this.is_null() {
+        return false;
+    }
+    match pipeline(this).rt_only {
+        RayOnly::No => false,
+        RayOnly::Skin => *SKIN.get_or_init(|| off("VICTORY_RT_SKIN")),
+        RayOnly::Resolve => *RESOLVE.get_or_init(|| off("VICTORY_RT_RESOLVE")),
+        RayOnly::Activate => *ACTIVATE.get_or_init(|| off("VICTORY_ACTIVATE_RAYS")),
+        RayOnly::Trace => *TRACE.get_or_init(|| off("VICTORY_RT_TRACE")),
+    }
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -418,6 +565,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// What it does only for rays ([`for_rays`]).
+    #[cfg(windows)]
+    rt_only: RayOnly,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -456,25 +606,17 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
-/// LOCAL (fxceless a35c557393): as [`host_pipeline`], for a draw into views
-/// of the formats `bound`: if one has another format than the pipeline
-/// declares for its slot, the host pipeline made for the bound formats.
-#[cfg(windows)]
-pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
-        return None;
-    }
-    let p = &pipeline(this).host;
-    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
-        return make::for_formats(p, bound);
-    }
-    make::ready(p)
-}
-
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// Draws and dispatches asked of pipelines left out on purpose since the last
+/// call (ray-tracing passes without the structure builder).
+#[cfg(windows)]
+pub(crate) fn take_left_out() -> u64 {
+    make::take_left_out()
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
@@ -483,12 +625,12 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
-        .filter(|hash| !hash.is_empty() && !hash.eq_ignore_ascii_case("none"))
+        .filter(|hash| !hash.is_empty())
         .filter_map(|hash| {
             if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 Some(hash.to_ascii_lowercase())
@@ -503,16 +645,12 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        let set: std::collections::HashSet<String> = parse_skip_hashes(&value).into_iter().collect();
-        if !set.is_empty() {
-            tracing::info!(count = set.len(), "VICTORY_SKIP_PIPELINES active");
-        }
-        set
+        parse_skip_hashes(&value)
     });
     if hashes.is_empty() {
         return None;
@@ -523,7 +661,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
@@ -587,7 +725,7 @@ fn hand_out(
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
-    make::early(&host);
+    let host = make::early(host);
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -604,6 +742,13 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        rt_only: shaders
+            .iter()
+            .filter(|s| s.stage == "compute")
+            .map(|s| for_rays(&s.container))
+            .find(|k| *k != RayOnly::No)
+            .unwrap_or(RayOnly::No),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -805,6 +950,7 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+    known::flush();
 }
 
 #[cfg(test)]

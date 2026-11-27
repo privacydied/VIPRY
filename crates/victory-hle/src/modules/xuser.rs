@@ -348,6 +348,33 @@ mod tests {
         }
     }
 
+    /// No picker ever: whatever valid `XUserAddOptions` the title passes
+    /// (none, default user silently, allow guests, default user allowing UI,
+    /// guests with UI), the add is done before it returns, with the one user.
+    #[test]
+    fn adding_a_user_never_waits_for_a_picker() {
+        type Add = extern "system" fn(This, u32, *mut AsyncBlock) -> HRESULT;
+        type AddResult = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
+        let this: This = &OBJECT;
+        for options in [0, 1, 2, 4, 6] {
+            let mut block = AsyncBlock {
+                queue: std::ptr::null(),
+                context: std::ptr::null_mut(),
+                callback: None,
+                internal: [0; 4],
+            };
+            assert_eq!(slot::<Add>(&OBJECT, 0x38)(this, options, &mut block), S_OK);
+            assert_eq!(
+                xasync::XAsyncGetStatus(&mut block, false),
+                S_OK,
+                "options {options}: done without waiting"
+            );
+            let mut handle = std::ptr::null();
+            let hr = slot::<AddResult>(&OBJECT, 0x40)(this, &mut block, &mut handle);
+            assert_eq!((hr, handle), (S_OK, user()), "options {options}");
+        }
+    }
+
     #[test]
     fn startup_adds_the_user_and_reads_its_id() {
         type Add = extern "system" fn(This, u32, *mut AsyncBlock) -> HRESULT;

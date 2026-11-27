@@ -238,10 +238,6 @@ impl Recording {
                     return;
                 };
                 if inner.back == 0 {
-                    if self.abandoned.load(Acquire) {
-                        inner.kept.push(chunk);
-                        continue;
-                    }
                     inner.back = back_list(self.kind) as usize;
                 }
                 (chunk, inner.back as This)
@@ -268,7 +264,6 @@ impl Recording {
 
 impl Drop for Recording {
     fn drop(&mut self) {
-        const BACKS_MAX: usize = 256;
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
         give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
         if inner.back != 0 {
@@ -277,19 +272,7 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            let keep = {
-                let mut backs = held(&BACKS);
-                if backs.len() < BACKS_MAX {
-                    backs.push(inner.back);
-                    true
-                } else {
-                    false
-                }
-            };
-            if !keep {
-                // SAFETY: our boxed back-list shell, no longer referenced.
-                drop(unsafe { Box::from_raw(inner.back as *mut List) });
-            }
+            held(&BACKS).push(inner.back);
         }
     }
 }
@@ -304,16 +287,16 @@ fn give_back(streams: Vec<Vec<u64>>) {
     }
 }
 
-/// A list shell of ours: its `HostList` is claimed from `IDLE` inside `reset()`
-/// when translation begins, and taken by `detach_thin()` on unfold so idle
-/// shells in `BACKS` hold zero D3D12 command allocators.
+/// A list of ours, closed.
 fn back_list(kind: u32) -> This {
     if let Some(back) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    Box::into_raw(super::boxed_back(kind)).cast_const().cast()
+    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
+    super::close(list);
+    list
 }
 
 fn start() {
@@ -486,6 +469,22 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+/// Work of ours (`super::external`), boxed.
+const EXTERNAL: u64 = after(17);
+
+/// Writes down work of ours at this place of a title list's stream
+/// ([`super::external`]); gives it back if the list is not written down.
+pub(super) fn put_external(this: This, work: super::External) -> Result<(), super::External> {
+    if !wanted() || !on() {
+        return Err(work);
+    }
+    let front = front(this);
+    if front.closed || front.recording.is_none() {
+        return Err(work);
+    }
+    front.put(EXTERNAL, &[Box::into_raw(Box::new(work)) as u64]);
+    Ok(())
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -564,9 +563,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
-    let needs = super::groups_need_uav(count, groups);
-    front(this).put(BARRIER_GROUPS, &[u64::from(count), u64::from(needs)]);
+extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
@@ -717,6 +715,15 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             held(uploads).push(block);
             continue;
         }
+        if op == EXTERNAL {
+            // SAFETY: made by `put_external`, named once.
+            let work = *unsafe { Box::from_raw(w[0] as *mut super::External) };
+            // (A recording let go of drops it unrun.)
+            if !skip {
+                super::run_external(list, work);
+            }
+            continue;
+        }
         if skip && op != CLOSE && op != RESET {
             continue;
         }
@@ -737,7 +744,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             BARRIER => {
                 super::barrier(list, n as u32, at_or(w, 1));
             }
-            BARRIER_GROUPS => super::barrier_groups_checked(list, n as u32, w.get(1).is_none_or(|&v| v != 0)),
+            BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
             VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
             SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
             BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
@@ -915,6 +922,46 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { *at::<[u32; 3]>(&w[1..], 2, 3) }, [7, 8, 9]);
         assert!(at::<u32>(&w[1..], 2, 0).is_null());
+    }
+
+    /// Work of ours written down in a stream is taken out of it once: run
+    /// on the list the stream is translated on, or dropped unrun when the
+    /// recording was let go of (or there is no host list).
+    #[test]
+    fn external_work_is_taken_out_once() {
+        use std::sync::atomic::AtomicUsize;
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Relaxed);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let make = || -> super::super::External {
+            let guard = Counted(dropped.clone());
+            let ran = ran.clone();
+            Box::new(move |_| {
+                let _kept = &guard;
+                ran.fetch_add(1, Relaxed);
+                true
+            })
+        };
+        let mut f = Front::default();
+        f.recording = Some(Arc::new(Recording::new(0)));
+        f.put(EXTERNAL, &[Box::into_raw(Box::new(make())) as u64]);
+        f.put(Plain::TOPOLOGY as u64, &[4]);
+        f.put(EXTERNAL, &[Box::into_raw(Box::new(make())) as u64]);
+        let s = std::mem::take(&mut f.words);
+        let (calls, closed) = translate(std::ptr::null(), &s, || true);
+        assert_eq!((calls, closed), (3, false));
+        assert_eq!((ran.load(Relaxed), dropped.load(Relaxed)), (0, 2));
+        // Not let go of, but without a host list behind it: dropped unrun.
+        f.put(EXTERNAL, &[Box::into_raw(Box::new(make())) as u64]);
+        let s = std::mem::take(&mut f.words);
+        assert_eq!(translate(std::ptr::null(), &s, || false), (1, false));
+        assert_eq!((ran.load(Relaxed), dropped.load(Relaxed)), (0, 3));
+        f.recording = None;
     }
 
     /// A view's record is the one at the call, also if its slot is written

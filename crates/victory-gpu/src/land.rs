@@ -30,7 +30,7 @@
 //! that the next refresh takes them as before.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 /// The unit pieces are cut in (of title memory), and the guards' blocks.
 pub(crate) const BLOCK: usize = 64 << 10;
@@ -115,26 +115,7 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 24;
     /// Jobs.
     pub(crate) const JOBS: usize = 25;
-    /// Parts of [`READ_BACKS`]: textures shaders wrote that the title reads
-    /// (`texback::land`), buffer read-backs (map and copy into title memory),
-    /// and the flight's card plan and own work told done.
-    pub(crate) const RB_TEXTURES: usize = 26;
-    pub(crate) const RB_BUFFERS: usize = 27;
-    pub(crate) const RB_DONE: usize = 28;
-    /// Counts for those: texture read-backs landed, buffer read-backs and
-    /// their bytes.
-    pub(crate) const RB_TEXTURE_COUNT: usize = 29;
-    pub(crate) const RB_BUFFER_COUNT: usize = 30;
-    pub(crate) const RB_BUFFER_BYTES: usize = 31;
-    /// Writing texture read-backs into title memory (`texback::write`, on
-    /// its own thread unless `VICTORY_TEXBACK_ASYNC=0`): waiting for the
-    /// locks against mapping changes, the work after, read-backs written,
-    /// and those replaced by a newer one before they were.
-    pub(crate) const TB_WAIT: usize = 32;
-    pub(crate) const TB_WORK: usize = 33;
-    pub(crate) const TB_WRITTEN: usize = 34;
-    pub(crate) const TB_REPLACED: usize = 35;
-    pub(crate) const COUNT: usize = 36;
+    pub(crate) const COUNT: usize = 26;
 }
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -192,25 +173,6 @@ pub(crate) fn log(frames: f64) {
         ms(stat::REST),
     );
     tracing::info!(
-        "read-backs and lists per frame: textures shaders wrote {:.2} ms ({:.1} landed), buffer read-backs {:.2} ms \
-         ({:.1} of them, {:.2} MB), card plans and own work done {:.2} ms",
-        ms(stat::RB_TEXTURES),
-        s[stat::RB_TEXTURE_COUNT],
-        ms(stat::RB_BUFFERS),
-        s[stat::RB_BUFFER_COUNT],
-        mb(s[stat::RB_BUFFER_BYTES]),
-        ms(stat::RB_DONE),
-    );
-    tracing::info!(
-        "texture read-backs written per frame (VICTORY_TEXBACK_ASYNC={}): {:.1}, {:.1} replaced by a newer one first; \
-         waiting for the mapping locks {:.2} ms, tiling and writing {:.2} ms",
-        u8::from(std::env::var_os("VICTORY_TEXBACK_ASYNC").is_none_or(|v| v != "0")),
-        s[stat::TB_WRITTEN],
-        s[stat::TB_REPLACED],
-        ms(stat::TB_WAIT),
-        ms(stat::TB_WORK),
-    );
-    tracing::info!(
         "landed per frame: {:.0} pieces, {:.0} with a new byte; of their {:.0} pages of 4 KiB {:.0} with a new byte ({:.1} MB), \
          {:.1} MB in blocks of 32 bytes with one, {:.2} MB put as dwords; {:.0} pieces through a view of ours \
          (VICTORY_LAND_BESIDE={}), {:.0} through the title's; {:.0} pages not there; asked for twice in a landing {:.1} MB; \
@@ -234,69 +196,43 @@ pub(crate) fn log(frames: f64) {
 }
 
 /// Threads kept for landing, and the work they are at.
-///
-/// Uses lock-free atomic work stealing (`next.fetch_add`) with a packed
-/// `(epoch << 16) | active` `AtomicU64` state word and short configurable spin
-/// before parking on a `Condvar` — eliminating the per-item mutex lock and
-/// immediate OS Condvar sleep across `victory-under`, `victory-land`,
-/// `victory-records`, and `victory-views`.
 struct Pool {
-    /// Serializes callers of [`Pool::each`].
-    turn: Mutex<()>,
-    /// High 48 bits: `epoch` (odd = open batch, even = closed).
-    /// Low 16 bits: `active` helper threads currently inside the batch.
-    state: AtomicU64,
-    next: std::sync::atomic::AtomicUsize,
-    count: std::sync::atomic::AtomicUsize,
-    panicked: std::sync::atomic::AtomicBool,
-    /// Number of helpers sleeping on `more`.
-    sleepers: std::sync::atomic::AtomicUsize,
-    /// Current batch closure; written only under `turn` while `epoch` is even
-    /// and `active == 0`, read by helpers only while counted in `active`.
-    work: std::cell::UnsafeCell<Option<Work>>,
-    sleep_mu: Mutex<()>,
+    state: Mutex<State>,
     more: Condvar,
-    idle_mu: Mutex<()>,
     idle: Condvar,
+    /// One batch at a time.
+    turn: Mutex<()>,
     threads: usize,
+}
+
+struct State {
+    /// What to do with each number below `count`.
+    work: Option<Work>,
+    next: usize,
+    count: usize,
+    /// Helpers inside a call.
+    running: usize,
+    panicked: bool,
 }
 
 #[derive(Clone, Copy)]
 struct Work(*const (dyn Fn(usize) + Sync));
 
 // SAFETY: the closure may be called from any thread (`Sync`), and
-// `Pool::each` keeps it alive until `epoch` is even and `active == 0`.
+// `Pool::each` keeps it alive until no helper is inside a call.
 unsafe impl Send for Work {}
-// SAFETY: `work` is synchronized via `turn` and the `state` epoch/active word.
-unsafe impl Sync for Pool {}
-
-const ACTIVE_MASK: u64 = 0xFFFF;
-const EPOCH_STEP: u64 = 1 << 16;
-
-fn pool_spin_us() -> u64 {
-    static US: OnceLock<u64> = OnceLock::new();
-    *US.get_or_init(|| {
-        std::env::var("VICTORY_WIDE_SPIN")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(10)
-    })
-}
 
 impl Pool {
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn new(name: &'static str, threads: usize) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
-            turn: Mutex::new(()),
-            state: AtomicU64::new(0),
-            next: std::sync::atomic::AtomicUsize::new(0),
-            count: std::sync::atomic::AtomicUsize::new(0),
-            panicked: std::sync::atomic::AtomicBool::new(false),
-            sleepers: std::sync::atomic::AtomicUsize::new(0),
-            work: std::cell::UnsafeCell::new(None),
-            sleep_mu: Mutex::new(()),
+            state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
             more: Condvar::new(),
-            idle_mu: Mutex::new(()),
             idle: Condvar::new(),
+            turn: Mutex::new(()),
             threads,
         }));
         for i in 1..threads {
@@ -313,88 +249,26 @@ impl Pool {
         pool
     }
 
-    #[inline]
-    fn has_open_work(&self) -> bool {
-        let s = self.state.load(Ordering::Acquire);
-        ((s >> 16) & 1) == 1 && self.next.load(Ordering::Relaxed) < self.count.load(Ordering::Relaxed)
-    }
-
-    fn try_enter(&self) -> bool {
-        let mut s = self.state.load(Ordering::Acquire);
-        loop {
-            if ((s >> 16) & 1) == 0 || self.next.load(Ordering::Relaxed) >= self.count.load(Ordering::Relaxed) {
-                return false;
-            }
-            match self
-                .state
-                .compare_exchange_weak(s, s + 1, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return true,
-                Err(cur) => s = cur,
-            }
-        }
-    }
-
     fn help(&self) {
-        let spin_us = pool_spin_us();
+        // (The thread that calls `each` waits for this one's share.)
+        let mut priority = crate::cores::Priority::new();
+        let mut state = self.state();
         loop {
-            if !self.try_enter() {
-                if spin_us > 0 {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_micros(spin_us);
-                    let mut entered = false;
-                    while std::time::Instant::now() < deadline {
-                        if self.has_open_work() && self.try_enter() {
-                            entered = true;
-                            break;
-                        }
-                        std::hint::spin_loop();
-                    }
-                    if entered {
-                        // Fall through to execute the entered batch.
-                    } else {
-                        let mut guard = self.sleep_mu.lock().unwrap_or_else(|e| e.into_inner());
-                        self.sleepers.fetch_add(1, Ordering::SeqCst);
-                        while !self.has_open_work() {
-                            guard = self.more.wait(guard).unwrap_or_else(|e| e.into_inner());
-                        }
-                        self.sleepers.fetch_sub(1, Ordering::SeqCst);
-                        drop(guard);
-                        continue;
-                    }
-                } else {
-                    let mut guard = self.sleep_mu.lock().unwrap_or_else(|e| e.into_inner());
-                    self.sleepers.fetch_add(1, Ordering::SeqCst);
-                    while !self.has_open_work() {
-                        guard = self.more.wait(guard).unwrap_or_else(|e| e.into_inner());
-                    }
-                    self.sleepers.fetch_sub(1, Ordering::SeqCst);
-                    drop(guard);
-                    continue;
-                }
-            }
-            // SAFETY: counted in `active` while `epoch` was odd, so `work` is live
-            // until we decrement `active` below.
-            let work = unsafe { (*self.work.get()).expect("open pool batch has work") };
-            let count = self.count.load(Ordering::Relaxed);
+            let Some((work, i)) = take(&mut state) else {
+                state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
+            state.running += 1;
+            drop(state);
             let working = crate::timeline::span("a landing's job");
-            let mut had_panic = false;
-            loop {
-                let i = self.next.fetch_add(1, Ordering::Relaxed);
-                if i >= count {
-                    break;
-                }
-                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
-                if ran.is_err() {
-                    had_panic = true;
-                }
-            }
+            // SAFETY: counted in `running`, so `each` has not returned.
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
             working.end();
-            if had_panic {
-                self.panicked.store(true, Ordering::Release);
-            }
-            let prev = self.state.fetch_sub(1, Ordering::AcqRel);
-            if (prev & ACTIVE_MASK) == 1 && ((prev >> 16) & 1) == 0 {
-                let _g = self.idle_mu.lock().unwrap_or_else(|e| e.into_inner());
+            priority.keep();
+            state = self.state();
+            state.running -= 1;
+            state.panicked |= ran.is_err();
+            if state.running == 0 {
                 self.idle.notify_all();
             }
         }
@@ -410,57 +284,45 @@ impl Pool {
         let _spread = crate::timeline::span("landing: spread over threads");
         let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the lifetime is left out only until this call returns, and
-        // it does not before `epoch` is even and `active == 0`.
+        // it does not before no helper is inside `f` and none can enter.
         let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
-        // SAFETY: under `_turn`, `epoch` is even and `active == 0`.
-        unsafe { *self.work.get() = Some(work) };
-        self.count.store(count, Ordering::Relaxed);
-        self.next.store(0, Ordering::Relaxed);
-        self.panicked.store(false, Ordering::Relaxed);
-        // Open batch (epoch becomes odd); SeqCst pairs with workers' `sleepers.fetch_add(SeqCst)`.
-        self.state.fetch_add(EPOCH_STEP, Ordering::SeqCst);
-        if self.sleepers.load(Ordering::SeqCst) > 0 {
-            let _g = self.sleep_mu.lock().unwrap_or_else(|e| e.into_inner());
-            if count > self.threads {
-                self.more.notify_all();
-            } else {
-                (1..count).for_each(|_| self.more.notify_one());
-            }
+        let mut state = self.state();
+        (state.work, state.next, state.count, state.panicked) = (Some(work), 0, count, false);
+        drop(state);
+        if count > self.threads {
+            self.more.notify_all();
+        } else {
+            (1..count).for_each(|_| self.more.notify_one());
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                let i = self.next.fetch_add(1, Ordering::Relaxed);
-                if i >= count {
-                    break;
-                }
+                let Some((_, i)) = take(&mut self.state()) else { break };
                 f(i);
             }
         }));
-        // Close batch (epoch becomes even) so no more helpers enter.
-        let prev = self.state.fetch_add(EPOCH_STEP, Ordering::AcqRel);
-        if (prev & ACTIVE_MASK) > 0 {
-            let spin_us = pool_spin_us();
-            if spin_us > 0 {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_micros(spin_us);
-                while (self.state.load(Ordering::Acquire) & ACTIVE_MASK) > 0 && std::time::Instant::now() < deadline {
-                    std::hint::spin_loop();
-                }
-            }
-            if (self.state.load(Ordering::Acquire) & ACTIVE_MASK) > 0 {
-                let mut guard = self.idle_mu.lock().unwrap_or_else(|e| e.into_inner());
-                while (self.state.load(Ordering::Acquire) & ACTIVE_MASK) > 0 {
-                    guard = self.idle.wait(guard).unwrap_or_else(|e| e.into_inner());
-                }
-            }
+        let mut state = self.state();
+        // (After a panic here: nothing more is begun.)
+        state.work = None;
+        while state.running > 0 {
+            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
         }
-        // SAFETY: `epoch` is even and `active == 0`.
-        unsafe { *self.work.get() = None };
-        let panicked = self.panicked.load(Ordering::Acquire);
+        let panicked = state.panicked;
+        drop(state);
         if let Err(panic) = ran {
             std::panic::resume_unwind(panic);
         }
         assert!(!panicked, "a job of landing panicked");
     }
+}
+
+/// The next number of the batch, if there is one.
+fn take(state: &mut State) -> Option<(Work, usize)> {
+    let work = state.work?;
+    if state.next >= state.count {
+        return None;
+    }
+    state.next += 1;
+    Some((work, state.next - 1))
 }
 
 /// [`Pool::each`] on the threads kept for landing.
@@ -727,7 +589,7 @@ unsafe fn piece_at(
     // view's address stays where the title sees `title`. Not waited for: if
     // a change is under way, what the record of the views says now does
     // ([`anytime`]), or the title's own address.
-    let reading = beside.then(|| crate::watch::title_memory_reading_now_in(title, end)).flatten();
+    let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
     let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
     count(stat::PIECES, 1);
     count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);

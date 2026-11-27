@@ -12,6 +12,32 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// The bytes of payload every translated mesh shader declares and never
+/// reads. The host may put an amplification shader of its own in front of
+/// it (the launch of an indirect mesh record, `victory-gpu`'s `launch`),
+/// whose payload must have the size the mesh shader declares: a mesh
+/// shader that declares none is refused with one (the RTX 5080's driver
+/// returns `E_INVALIDARG`), and one that declares a payload is still taken
+/// without an amplification shader.
+pub const MESH_PAYLOAD_BYTES: u32 = 4;
+
+/// Whether the host puts its amplification shader in front of translated
+/// mesh shaders (`VICTORY_MESH_LAUNCH=1`, off by default). Only then do the
+/// translated mesh shaders declare [`MESH_PAYLOAD_BYTES`]; without it they
+/// declare none, as before.
+pub fn mesh_launch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LAUNCH").is_some_and(|v| v == "1"))
+}
+
+/// The payload bytes a translated mesh shader declares: [`MESH_PAYLOAD_BYTES`]
+/// while [`mesh_launch`] is on, else none.
+pub fn mesh_payload_bytes() -> u32 {
+    if mesh_launch() { MESH_PAYLOAD_BYTES } else { 0 }
+}
+/// The register space the host's amplification shader binds in (`b0`,
+/// `t0`, `u0`): no translated shader binds there.
+pub const LAUNCH_SPACE: u32 = 9;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -24,6 +50,11 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
+/// The same table of strides and format kinds as [`SLOT_STRIDES`], bound for
+/// shaders that only inspect views from descriptor tables (`RootType::Table`).
+/// Kept distinct from [`SLOT_STRIDES`] so the host binds the table without
+/// running the full bindless heap buffer sweep.
+pub const SLOT_TABLE_STRIDES: u8 = 252;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
@@ -34,25 +65,6 @@ pub const VIEW_INTEGER: u32 = 1 << 31;
 pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
-/// LOCAL (port of fxceless/victory-fork PR #1216, GamingRipperDoc): the
-/// [`SLOT_STRIDES`] dword of a slot that holds a constant buffer view (a
-/// stride no buffer has, no kind bits). A program reads a slot it picks as a
-/// constant buffer only where this mark is; a slot whose dword is 0 holds
-/// neither a buffer nor a constant buffer, and the read gives zeros. Read as
-/// a constant buffer, a texture's descriptor is taken as a buffer's: the
-/// meshlet culling `_Prev` passes then read whatever lies at a made-up
-/// address (a page fault on AMD).
-/// `VICTORY_CONSTANT_MARKS=1` turns it on. Off by default here (on in the
-/// PR): not yet run in the game on this tree, where a constant buffer slot
-/// whose mark is not written yet would read zeros.
-pub const SLOT_STRIDE_CONSTANT: u32 = VIEW_STRIDE_BITS;
-
-/// Whether [`SLOT_STRIDE_CONSTANT`] is in use: read once, by the host and
-/// the translator alike.
-pub fn constant_marks() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_some_and(|v| v == "1"))
-}
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -116,8 +128,8 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
-    /// ForceEarlyDepthStencil (`[earlydepthstencil]`; no `SFI0` bit).
-    pub const EARLY_DEPTH: u64 = 1 << 3;
+    /// ForceEarlyDepthStencil: HLSL's `[earlydepthstencil]` (no `SFI0` bit).
+    pub const EARLY_DEPTH_STENCIL: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -203,6 +215,27 @@ thread_local! {
 pub fn set_raw_views(first: u32) {
     debug_assert!(first == 0 || first.is_power_of_two());
     RAW_VIEWS.store(first, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`constants_raw`].
+    pub(crate) static CONSTANTS_RAW_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Renderer port 5 (`VICTORY_PORT_CBV=1`; off by default): constant buffers are read as raw
+/// bytes, a table's through the raw twin of its slot ([`raw_views`]), a root one as a root SRV,
+/// so the host can give the card the title's bytes where they are (16-byte aligned, which a
+/// constant buffer view cannot take) instead of a copy made at every submission. The host's
+/// views must follow: the twin of every constant buffer's slot a raw view of its bytes. Part of
+/// the translation: the shader cache keys on the switch.
+pub fn constants_raw() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CONSTANTS_RAW_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// See [`RAW_VIEWS`]: where shaders translated now read the buffers they pick (0: in place).
@@ -807,6 +840,11 @@ impl Shader {
             self.m.named_md("dx.viewIdState", vec![view_node]);
         }
 
+        if self.pixel {
+            container::same_mode_per_row(&mut self.inputs, true);
+        } else {
+            container::same_mode_per_row(&mut self.outputs, false);
+        }
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());
@@ -847,7 +885,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        mesh_payload_bytes(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];
