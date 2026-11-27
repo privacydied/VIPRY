@@ -2776,6 +2776,9 @@ struct Flight {
     /// The list of ours that ran ahead of them ([`card_steps`]).
     own: Option<card_steps::Taken>,
     texture_back_ranges: Vec<(usize, usize)>,
+    /// A present's copy keeps its place among the frames in flight
+    /// (`VICTORY_ASYNC_PRESENT`) until it has landed.
+    _frame: Option<std::sync::Arc<crate::queue::FrameSlot<'static>>>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -5378,6 +5381,7 @@ impl Host {
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
+                _frame: None,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -5408,6 +5412,16 @@ impl Host {
     /// submission whose number comes back has finished ([`FINISHED`]); 0 if
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList) -> u64 {
+        self.execute_own_in(list, None)
+    }
+
+    /// [`Host::execute_own`] for a present's copy: `frame` is the place the
+    /// frame holds among those in flight, kept until the flight has landed.
+    pub(crate) fn execute_own_in(
+        &self,
+        list: &HostList,
+        frame: Option<std::sync::Arc<crate::queue::FrameSlot<'static>>>,
+    ) -> u64 {
         late_threads();
         let Some((submitted, sent)) = self.submit(&[list], &[], true) else {
             return 0;
@@ -5434,6 +5448,7 @@ impl Host {
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
+                _frame: frame,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -9333,6 +9348,7 @@ impl Meter {
         crate::queue::behind_line(frames);
         crate::streamline::line(frames);
         card_clock_line(frames, ms);
+        crate::frame_wait::line(frames);
         two_queues::line(frames);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
@@ -9758,6 +9774,20 @@ impl Host {
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
     ) -> Option<bool> {
+        self.present_planes_in(texture, state, overlay, frame, None)
+    }
+
+    /// [`Host::present_planes`] for a present that holds a place among the
+    /// frames in flight (`slot`, `VICTORY_ASYNC_PRESENT`): the copy's flight
+    /// keeps it until it has landed.
+    pub(crate) fn present_planes_in(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+        slot_held: Option<std::sync::Arc<crate::queue::FrameSlot<'static>>>,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let planes = overlay.and_then(|(over, over_state)| {
@@ -9798,7 +9828,7 @@ impl Host {
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    return self.present_planes_in(texture, state_u32, None, frame, slot_held);
                 }
             }
         }
@@ -9838,7 +9868,7 @@ impl Host {
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made after resize; showing base plane only");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    return self.present_planes_in(texture, state_u32, None, frame, slot_held);
                 }
             }
         }
@@ -9899,7 +9929,7 @@ impl Host {
                         drop(back);
                         drop(presenter);
                         tracing::warn!(%err, "could not record display composite; presenting the base plane");
-                        return self.present_planes(texture, state_u32, None, frame);
+                        return self.present_planes_in(texture, state_u32, None, frame, slot_held);
                     }
                     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !ONCE.swap(true, Ordering::Relaxed) {
@@ -10003,7 +10033,7 @@ impl Host {
             copy.close();
             let flown = match slot {
                 Some(i) => {
-                    let flown = self.execute_own(copy);
+                    let flown = self.execute_own_in(copy, slot_held);
                     p.ahead[i].1 = flown;
                     flown
                 }

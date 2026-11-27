@@ -463,6 +463,9 @@ enum Job {
         Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
         Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
         super::Shown,
+        // Its place among the frames in flight (`VICTORY_ASYNC_PRESENT`),
+        // handed on to the flight of the present's copy.
+        Option<std::sync::Arc<super::FrameSlot<'static>>>,
     ),
 }
 
@@ -674,7 +677,7 @@ impl Work for Job {
                     crate::fence::set(fence as This, value);
                 }
             }
-            Job::Present(texture, overlay, shown) => {
+            Job::Present(texture, overlay, shown, slot) => {
                 if let Some((texture, state)) = texture {
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
@@ -683,7 +686,7 @@ impl Work for Job {
                         let st = if *ov_state == u32::MAX { ov.state.load(Relaxed) } else { *ov_state };
                         (&ov.texture, st)
                     });
-                    super::show_planes(&texture.texture, state, over, shown);
+                    super::show_planes(&texture.texture, state, over, shown, slot);
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
@@ -831,6 +834,7 @@ pub(super) fn drain() {
     if OURS.get() {
         return;
     }
+    let _timed = crate::frame_wait::time(crate::frame_wait::Call::Drain);
     let began = Instant::now();
     LANE.drain();
     STATS[DRAINING].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -931,10 +935,18 @@ pub(super) fn present(
     texture: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
     overlay: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
     shown: super::Shown,
+    slot: Option<std::sync::Arc<super::FrameSlot<'static>>>,
 ) {
     QUEUED.fetch_add(1, Relaxed);
     STATS[PRESENTS].fetch_add(1, Relaxed);
-    LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);
+    // With a place among the frames in flight the title is paced by those
+    // (it took the place before this call), not by the line.
+    let paced = slot.is_some();
+    LANE.push(this as usize, [Job::Present(texture, overlay, shown, slot)]);
+    if paced {
+        crate::frame_wait::queued();
+        return;
+    }
     let began = Instant::now();
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());

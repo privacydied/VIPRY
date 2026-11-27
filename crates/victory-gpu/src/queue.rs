@@ -67,6 +67,95 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether presents are paced by the frames in flight rather than by the
+/// line (`VICTORY_ASYNC_PRESENT=1`; off by default). Needs the thread of ours
+/// that prepares submissions ([`behind`], `VICTORY_ASYNC_SUBMIT=1`) and
+/// presents sent ahead.
+///
+/// The title's present then returns once the frame has a place among at
+/// most [`frames_ahead`] frames whose present copy has not landed on the
+/// card, instead of when the present before it has been sent
+/// (`VICTORY_SUBMIT_FRAMES`); the present serialises with the title's other
+/// presents; and a fence waited for without an event does not drain the
+/// line: it waits for the signal, which the line and the relay publish. A
+/// title that reuses storage of a frame in flight must wait for its fence,
+/// as it does with async submit.
+///
+/// Ported from stellarr-studio/kelvaroq 0046-async-present-frame-waits.
+#[cfg(windows)]
+pub(crate) fn async_present() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_ASYNC_PRESENT").is_some_and(|v| v == "1");
+        let enabled = asked && behind::on() && crate::host::late_free_present();
+        if asked && !enabled {
+            tracing::warn!("VICTORY_ASYNC_PRESENT=1 needs VICTORY_ASYNC_SUBMIT=1 and presents sent ahead (the relay): presents wait as before");
+        }
+        if enabled {
+            tracing::info!(frames_ahead = frames_ahead(), "presents wait for a place among the frames in flight, not for the line (VICTORY_ASYNC_PRESENT=1)");
+        }
+        enabled
+    })
+}
+
+/// Two queued or running presents by default (`VICTORY_FRAMES_AHEAD`, 1 to
+/// 8). A finite maximum also bounds the number of retained back-buffer
+/// copies for a mistyped limit.
+#[cfg(windows)]
+fn frames_ahead() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_FRAMES_AHEAD")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 8)
+    })
+}
+
+/// The frames in flight: a place belongs to both the present in the line and
+/// its copy's flight on the card. The last owner returns it, errors
+/// included. A change of presenting queue waits until the older frames have
+/// left, so display order holds across queues as well.
+#[cfg(windows)]
+struct FrameLimit {
+    /// The presenting queue, and the number of places taken.
+    active: std::sync::Mutex<(usize, usize)>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(windows)]
+pub(crate) struct FrameSlot<'a>(&'a FrameLimit);
+
+#[cfg(windows)]
+impl FrameLimit {
+    const fn new() -> Self {
+        FrameLimit { active: std::sync::Mutex::new((0, 0)), changed: std::sync::Condvar::new() }
+    }
+
+    fn enter(&self, queue: usize, limit: usize) -> FrameSlot<'_> {
+        let mut active = lock(&self.active);
+        let available = |&(owner, count): &(usize, usize)| count == 0 || (owner == queue && count < limit);
+        if !available(&active) {
+            let _pacing = crate::frame_wait::time(crate::frame_wait::Call::Pacing);
+            active = self.changed.wait_while(active, |state| !available(state)).unwrap_or_else(|e| e.into_inner());
+        }
+        *active = (queue, active.1 + 1);
+        FrameSlot(self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FrameSlot<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.active).1 -= 1;
+        self.0.changed.notify_all();
+    }
+}
+
+#[cfg(windows)]
+static SLOTS: FrameLimit = FrameLimit::new();
+
 /// Whether queues wait for fences. `VICTORY_QUEUE_WAIT=0`: they do not,
 /// and every submission runs when it is made (as before).
 #[cfg(windows)]
@@ -768,6 +857,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 /// ([`Held`]) until a signal or a list's bottom-of-pipe write gets the
 /// fence there.
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    #[cfg(windows)]
+    let _timed = crate::frame_wait::time(crate::frame_wait::Call::QueueFence);
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -931,6 +1022,17 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = this;
+    #[cfg(windows)]
+    let _timed = crate::frame_wait::time(crate::frame_wait::Call::Present);
+    // With `VICTORY_ASYNC_PRESENT=1` the title's presents go one at a time:
+    // the frame number and the place in the line are taken together.
+    #[cfg(windows)]
+    static CALLS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(windows)]
+    let _serial = async_present().then(|| {
+        let _turn = crate::frame_wait::time(crate::frame_wait::Call::PresentTurn);
+        lock(&CALLS)
+    });
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     let called = crate::timeline::span("the title's Present");
@@ -1035,11 +1137,22 @@ extern "system" fn present(
             .filter(|&over_res| base_res != Some(over_res))
             .and_then(take_copy);
         let resource = texture.as_ref().map_or(0, |t| t.0);
+        // A place among the frames in flight, taken before the present goes
+        // in the line (a frame that is to be read back at once is the only
+        // one in flight, as it stands at its present).
+        let slot = async_present().then(|| {
+            #[cfg(feature = "diagnostics")]
+            let alone = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            #[cfg(not(feature = "diagnostics"))]
+            let alone = false;
+            std::sync::Arc::new(SLOTS.enter(this as usize, if alone { 1 } else { frames_ahead() }))
+        });
         behind::present(
             this,
             texture.map(|(_, copy, state)| (copy, state)),
             overlay.map(|(_, copy, state)| (copy, state)),
             Shown { frame, resource },
+            slot,
         );
         called.end();
         #[cfg(feature = "diagnostics")]
@@ -1076,6 +1189,7 @@ extern "system" fn present(
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
             Shown { frame, resource: resource as usize },
+            None,
         );
         crate::resource::host_transition(resource, state);
         if let Some((over_res, _, over_state)) = overlay {
@@ -1118,11 +1232,13 @@ fn show_planes(
     state: u32,
     overlay: Option<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
     what: Shown,
+    slot: Option<std::sync::Arc<FrameSlot<'static>>>,
 ) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present_planes(texture, state, overlay, what.frame);
+    let _show = crate::frame_wait::time(crate::frame_wait::Call::Show);
+    let shown = host.present_planes_in(texture, state, overlay, what.frame, slot);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]
@@ -1306,6 +1422,59 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (Ported from stellarr-studio/kelvaroq 0046.) A place among the frames
+    /// in flight stays taken until its last owner, the present copy's
+    /// flight, lets go of it.
+    #[cfg(windows)]
+    #[test]
+    fn a_frame_slot_stays_taken_until_its_gpu_owner_leaves() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        use std::time::Duration;
+        let limit = FrameLimit::new();
+        let first = std::sync::Arc::new(limit.enter(1, 2));
+        let on_card = first.clone();
+        let second = limit.enter(1, 2);
+        drop(first);
+        std::thread::scope(|scope| {
+            let (trying, tried) = channel();
+            let (entered, entry) = channel();
+            let limit = &limit;
+            scope.spawn(move || {
+                trying.send(()).unwrap();
+                let _third = limit.enter(1, 2);
+                entered.send(()).unwrap();
+            });
+            tried.recv().unwrap();
+            assert_eq!(entry.recv_timeout(Duration::from_millis(20)), Err(RecvTimeoutError::Timeout));
+            drop(on_card);
+            entry.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        assert_eq!(*lock(&limit.active), (1, 1));
+        drop(second);
+        assert_eq!(*lock(&limit.active), (1, 0));
+    }
+
+    /// A change of presenting queue waits for the older frames to leave.
+    #[cfg(windows)]
+    #[test]
+    fn a_frame_slot_of_another_queue_waits_for_the_older_frames() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        use std::time::Duration;
+        let limit = FrameLimit::new();
+        let older = limit.enter(1, 2);
+        std::thread::scope(|scope| {
+            let (entered, entry) = channel();
+            let limit = &limit;
+            scope.spawn(move || {
+                let _other = limit.enter(2, 2);
+                entered.send(()).unwrap();
+            });
+            assert_eq!(entry.recv_timeout(Duration::from_millis(20)), Err(RecvTimeoutError::Timeout));
+            drop(older);
+            entry.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+    }
     use crate::object::slot;
 
     /// Where a queue's signal is: newer layouts have it two slots later.
