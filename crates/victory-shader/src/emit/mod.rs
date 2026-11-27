@@ -505,8 +505,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
-        .part(FourCC::DXIL)
-        .or(c.part(FourCC::ACCC))
+        .native_part()
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
         .into_iter()
@@ -528,6 +527,17 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// Runs `f` as on a host whose widest wave has `lanes` lanes, on this
+/// thread only (tests outside this module that translate for both kinds of
+/// host).
+#[cfg(test)]
+pub(crate) fn with_test_host_wave<R>(lanes: u32, f: impl FnOnce() -> R) -> R {
+    let was = lower::TEST_HOST_WAVE.replace(Some(lanes));
+    let r = f();
+    lower::TEST_HOST_WAVE.set(was);
+    r
 }
 
 /// Emits a program whose earlier stages already ran.

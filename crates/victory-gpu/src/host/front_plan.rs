@@ -42,22 +42,28 @@ fn list_front(steps: &[Step], textures: bool) -> ListFront {
     let mut shadows: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>)> = Vec::new();
     let mut staged: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
     let mut refreshed: ByCopy<()> = ByCopy::default();
-    let touches = steps.iter().filter_map(|step| match step {
-        Step::Refresh(shadow, from, len) => {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            if refreshed.insert(key, ()).is_none() {
-                shadows.push((key, shadow.clone()));
+    // A set (`VICTORY_REFRESH_SET`) counts once per list: a repeat in the
+    // list, or in a later list of the same part, adds nothing to the spans
+    // `join_keys` makes, as in `refresh_front`'s own walk.
+    let mut once = super::sets::Once::default();
+    let mut touches = Vec::new();
+    for step in steps {
+        match step {
+            Step::Refresh(..) | Step::RefreshSet(_) => {
+                for (shadow, from, len) in super::sets::refreshes(step, &mut once) {
+                    let key = std::sync::Arc::as_ptr(shadow) as usize;
+                    if refreshed.insert(key, ()).is_none() {
+                        shadows.push((key, shadow.clone()));
+                    }
+                    touches.push(Touch::Refresh(key, from, from + len));
+                }
             }
-            Some(Touch::Refresh(key, *from, *from + *len))
+            Step::GpuWrite(shadow, ..) => touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
+            Step::Texture(staging) if textures => staged.push(staging.clone()),
+            _ => {}
         }
-        Step::GpuWrite(shadow, ..) => Some(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
-        Step::Texture(staging) if textures => {
-            staged.push(staging.clone());
-            None
-        }
-        _ => None,
-    });
-    let copies = fold_touches(touches);
+    }
+    let copies = fold_touches(touches.into_iter());
     ListFront { copies, shadows, textures: staged }
 }
 

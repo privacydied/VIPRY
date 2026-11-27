@@ -195,3 +195,33 @@ pub(super) fn give_back(left: &std::sync::atomic::AtomicI64, most: i64, copies: 
     debug_assert!(copies <= most);
     left.fetch_add(most - copies, Ordering::Relaxed);
 }
+
+/// [`super::compare_piece`] of a copy in the card's memory with the switch:
+/// `title` (read at `lo`, `at` from the copy's start) compared with `held`
+/// and put in it in one pass ([`word_runs_put`]), the most copies of their
+/// own taken from `left` first ([`take_most`]) and what is not used given
+/// back. `None` where the pass is as before: the switch off, the words not
+/// aligned, the up-check on, or not enough left to take.
+pub(super) fn fused_piece(
+    at: usize,
+    lo: usize,
+    title: &[u8],
+    held: &mut [u8],
+    left: &std::sync::atomic::AtomicI64,
+) -> Option<Vec<(usize, usize)>> {
+    let n = title.len();
+    if !(crate::host::words_under()
+        && under_fused()
+        && !crate::host::upcheck::on()
+        && at % 4 == 0
+        && lo % 4 == 0
+        && n % 4 == 0)
+    {
+        return None;
+    }
+    let most = take_most(left, n)?;
+    let runs = word_runs_put(lo, title, held);
+    let copies = runs.iter().filter(|&&(r, m)| !crate::host::goes_as_words(at + r, m)).count() as i64;
+    give_back(left, most, copies);
+    Some(runs)
+}

@@ -977,6 +977,29 @@ impl<'a> Tracer<'a> {
             .ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
+            // The table of vertex buffer descriptors a vertex program made
+            // from loose pieces gets in s0 and s1: a 64-bit address of which
+            // the code keeps 40 bits (`s_bfe_u32` of the high half, 8 bits
+            // from bit 0), at a constant offset (16 bytes a slot).
+            RootType::Other(crate::native::VERTEX_BUFFERS) => {
+                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
+                let input = self.p.inputs.iter().find(|i| i.0 == high);
+                let high = Term::Value(input.ok_or("a vertex buffer table without its high half")?.1);
+                let kept = matches!(hi, Term::Value(v) if self.sop2(v, &["s_bfe_u32"]).is_some_and(
+                    |(_, [from, field])| from == high && field == Term::Const(0x8_0000)
+                ));
+                if !(kept || hi == high) {
+                    return Err("an address with an untracked high half");
+                }
+                if s.dynamic.is_some() || extra.dynamic.is_some() {
+                    return Err("a vertex buffer picked by a computed slot");
+                }
+                return Ok(Address {
+                    param,
+                    offset: s.offset.wrapping_add(extra.offset),
+                    dynamic: None,
+                });
+            }
             RootType::Descriptor => {
                 let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
                 let input = self.p.inputs.iter().find(|i| i.0 == high);

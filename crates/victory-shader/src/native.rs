@@ -72,6 +72,8 @@
 use crate::ShaderError::{self, Malformed};
 use crate::dxbc::{u32_at, u64_at};
 
+pub mod pieces;
+
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
 const KIND_NATIVE: u32 = 0x0d;
@@ -231,6 +233,38 @@ pub struct PsInput {
     pub row2: u8,
 }
 
+impl PsInput {
+    /// The first `row` of an input that no vertex parameter feeds: its
+    /// `SPI_PS_INPUT_CNTL` names the constant offset (OFFSET 0x20) and
+    /// DEFAULT_VAL says the value. Rows 252 to 255 are those four values,
+    /// so that the row alone says it; real rows are below 32 and never name
+    /// a signature element here.
+    pub const CONSTANT_ROWS: u8 = 252;
+
+    /// The row of the input that is the constant DEFAULT_VAL `value` names.
+    pub fn constant_row(value: u8) -> u8 {
+        Self::CONSTANT_ROWS + (value & 3)
+    }
+
+    /// DEFAULT_VAL of the input at `row`, if it is a constant: 0 reads
+    /// (0, 0, 0, 0), 1 (0, 0, 0, 1), 2 (1, 1, 1, 0) and 3 (1, 1, 1, 1), by
+    /// the register's documentation and Mesa's `AC_EXP_PARAM_DEFAULT_VAL_*`.
+    pub fn default_value(row: u8) -> Option<u8> {
+        row.checked_sub(Self::CONSTANT_ROWS)
+    }
+
+    /// Channel `ch` of the constant DEFAULT_VAL `value` names.
+    pub fn default_channel(value: u8, ch: u8) -> f32 {
+        let one = match value & 3 {
+            0 => false,
+            1 => ch == 3,
+            2 => ch < 3,
+            _ => true,
+        };
+        if one { 1.0 } else { 0.0 }
+    }
+}
+
 /// A vertex attribute the fetch shader loads: channel k into VGPR `vgpr + k`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VsInput {
@@ -238,6 +272,35 @@ pub struct VsInput {
     pub row: u8,
     pub mask: u8,
     pub vgpr: u8,
+}
+
+/// `RootType::Other` code of the layout entry for the address a vertex
+/// program made from loose pieces ([`crate::pieces`]) gets in s0 and s1: a
+/// table of 16-byte vertex buffer descriptors, one per input slot, which the
+/// program loads its buffers from to fetch its own attributes.
+pub const VERTEX_BUFFERS: u32 = 0x200;
+
+/// `RootType::Other` code of a layout entry that owns no user SGPR and marks a
+/// pixel program made from loose pieces: the translation takes what the pieces
+/// added only for a program with an entry in the 0x200 range, and a pixel
+/// program has no vertex buffer table to say so.
+pub const PIXEL_PIECES: u32 = 0x201;
+
+/// The same mark for a compute program made from loose pieces, which has no
+/// vertex buffer table either.
+pub const COMPUTE_PIECES: u32 = 0x202;
+
+/// An element of the input layout that a vertex program fetches itself
+/// ([`VERTEX_BUFFERS`]): `bytes` bytes of each vertex of buffer `slot`, from
+/// byte `offset`, in DXGI `format`. Its channels are row `row` of the input
+/// signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsFetch {
+    pub row: u8,
+    pub slot: u32,
+    pub offset: u32,
+    pub bytes: u32,
+    pub format: u32,
 }
 
 /// What `exp param<param>` of a vertex shader writes.
@@ -272,6 +335,9 @@ pub enum StageIo {
     Vs {
         inputs: Vec<VsInput>,
         outputs: Vec<VsOutput>,
+        /// The input layout's elements, for a program that fetches its
+        /// attributes itself (empty where a fetch shader does).
+        fetch: Vec<VsFetch>,
     },
     Ps {
         inputs: Vec<PsInput>,
@@ -424,11 +490,15 @@ pub struct UsedResource {
     pub slot: u8,
 }
 
-/// The native programs in a `DXIL` part's data, or in an `ACCC` part's
-/// ([`fspx_program`]); empty for the PC layout.
+/// The native programs in a `DXIL` part's data, in an `ACCC` part's
+/// ([`fspx_program`]), or in a part of ours that holds a program a title
+/// passed as loose pieces ([`crate::pieces`]); empty for the PC layout.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     if part.starts_with(b"FSPX") {
         return Ok(vec![fspx_program(part)?]);
+    }
+    if part.starts_with(crate::pieces::MAGIC) {
+        return Ok(vec![crate::pieces::program(part)?]);
     }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
@@ -509,17 +579,75 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
     let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
     let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
+    // An `ACCC` part's records are read as they always were: no root
+    // constants, no strides.
+    let Records { layout, used, .. } = records(
+        meta.get(FSPX_RECORDS..).unwrap_or(&[]),
+        RecordRules {
+            constants: false,
+            strides: false,
+        },
+    )?;
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: u32_at(packet, PACKET_RSRC2)?,
+            threads: [threads(0)?, threads(1)?, threads(2)?],
+        }),
+        code: code.to_vec(),
+    })
+}
+
+/// What the 32-byte records of a program's metadata say: the same stream
+/// in an `ACCC` part's kind 7 entry ([`fspx_program`]) and in the metadata
+/// pieces a title passes loose ([`pieces`]); only the header before the
+/// records differs.
+pub(crate) struct Records {
+    /// One entry per root parameter that arrives in user SGPRs.
+    pub(crate) layout: Vec<RootParam>,
+    /// One entry per 0x41 record, in the records' order.
+    pub(crate) used: Vec<UsedResource>,
+    /// A 0x42 record declares a sampler (class 3): one the code takes from
+    /// the sampler heap, which no 0x41 record describes.
+    pub(crate) heap_sampler: bool,
+}
+
+/// What [`records`] accepts beyond what an `ACCC` part ever held.
+#[derive(Clone, Copy)]
+pub(crate) struct RecordRules {
+    /// Take root constants (root type 0), each as one user SGPR until
+    /// [`size_constants`] has run; otherwise they are refused, as `ACCC`
+    /// parts always were.
+    pub(crate) constants: bool,
+    /// Take each record's stride (bytes 16..20, as in FSSM's used entries);
+    /// otherwise 0, as `ACCC` parts always were read.
+    pub(crate) strides: bool,
+}
+
+/// Reads metadata records from the first one: every 0x41, skipping 0x42,
+/// up to the 0x43 that ends them. Any other tag is refused.
+pub(crate) fn records(data: &[u8], rules: RecordRules) -> Result<Records, ShaderError> {
     let mut layout: Vec<RootParam> = Vec::new();
     let mut used = Vec::new();
-    for e in meta
-        .get(FSPX_RECORDS..)
-        .unwrap_or(&[])
-        .as_chunks::<FSPX_RECORD>()
-        .0
-    {
+    let mut heap_sampler = false;
+    for e in data.as_chunks::<FSPX_RECORD>().0 {
         match e[0] {
             0x41 => {}
-            0x42 => continue,
+            0x42 => {
+                // A sampler declaration (class 3 is DXIL's sampler class)
+                // that no table record of its register backs.
+                heap_sampler |= e[9] == 3
+                    && !used.iter().any(|u: &UsedResource| {
+                        u.kind == ResourceType::Sampler
+                            && u.root == RootType::Table
+                            && u.lower_bound == le32(e, 12)
+                    });
+                continue;
+            }
             0x43 => break,
             _ => return Err(Malformed("unknown FSPX metadata record")),
         }
@@ -535,7 +663,7 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             root,
             table_offset_dwords: le32(e, 8),
             lower_bound: le32(e, 12),
-            stride: 0,
+            stride: if rules.strides { le32(e, 16) } else { 0 },
             dwords: e[20],
             user_data: e[21],
             slot: e[22],
@@ -545,6 +673,8 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             RootType::Descriptor => 2,
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
+            // Sized below, once every parameter's first dword is known.
+            RootType::Constants if rules.constants => 1,
             _ => return Err(Malformed("an FSPX resource of an unknown root type")),
         };
         if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
@@ -559,18 +689,39 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }
         used.push(u);
     }
-    Ok(NativeProgram {
-        stage: HwStage::Cs,
-        wave64,
-        vgprs,
+    Ok(Records {
         layout,
         used,
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: u32_at(packet, PACKET_RSRC2)?,
-            threads: [threads(0)?, threads(1)?, threads(2)?],
-        }),
-        code: code.to_vec(),
+        heap_sampler,
     })
+}
+
+/// Gives each root constants parameter of `layout` its user SGPRs. A record
+/// names the parameter's first user-data dword and not how many it has, so
+/// it is taken to run up to the next parameter's first dword, or to the end
+/// of the `user_sgprs` when it is the last (one dword in every program
+/// seen). Also refuses a layout that reaches past the user SGPRs.
+pub(crate) fn size_constants(
+    layout: &mut [RootParam],
+    user_sgprs: u32,
+) -> Result<(), ShaderError> {
+    for i in 0..layout.len() {
+        let first = u32::from(layout[i].user_data);
+        if layout[i].root == RootType::Constants {
+            // The nearest parameter above this one bounds it.
+            let end = layout
+                .iter()
+                .map(|p| u32::from(p.user_data))
+                .filter(|&d| d > first)
+                .min()
+                .unwrap_or(user_sgprs);
+            layout[i].sgprs = end.saturating_sub(first);
+        }
+        if layout[i].sgprs == 0 || first + layout[i].sgprs > user_sgprs {
+            return Err(Malformed("a root parameter outside the user SGPRs"));
+        }
+    }
+    Ok(())
 }
 
 fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
@@ -835,7 +986,11 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
         })
         .collect();
     let outputs = vs_outputs(data)?;
-    Ok(StageIo::Vs { inputs, outputs })
+    Ok(StageIo::Vs {
+        inputs,
+        outputs,
+        fetch: Vec::new(),
+    })
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
@@ -975,6 +1130,7 @@ mod tests {
                     io: StageIo::Vs {
                         inputs: vec![],
                         outputs: vec![],
+                        fetch: vec![],
                     },
                     code: VS_CODE.to_vec()
                 },
@@ -1269,5 +1425,208 @@ mod tests {
         let mut bad_adler = good.clone();
         *bad_adler.last_mut().unwrap() ^= 1;
         assert!(unpack(&bad_adler).is_err());
+    }
+
+    /// The record loop of `fspx_program` as it was before it shared a reader
+    /// with the pieces parser: root constants refused, strides 0, a 0x42
+    /// record skipped without a look.
+    fn old_records(data: &[u8]) -> Result<(Vec<RootParam>, Vec<UsedResource>), &'static str> {
+        let mut layout: Vec<RootParam> = Vec::new();
+        let mut used = Vec::new();
+        for e in data.as_chunks::<FSPX_RECORD>().0 {
+            match e[0] {
+                0x41 => {}
+                0x42 => continue,
+                0x43 => break,
+                _ => return Err("unknown FSPX metadata record"),
+            }
+            let root = RootType::from_raw(e[5].into());
+            let u = UsedResource {
+                kind: match e[4] {
+                    0 => ResourceType::Srv,
+                    1 => ResourceType::Sampler,
+                    2 => ResourceType::Cbv,
+                    3 => ResourceType::Uav,
+                    n => ResourceType::Other(n),
+                },
+                root,
+                table_offset_dwords: le32(e, 8),
+                lower_bound: le32(e, 12),
+                stride: 0,
+                dwords: e[20],
+                user_data: e[21],
+                slot: e[22],
+            };
+            let sgprs = match root {
+                RootType::Table => 1,
+                RootType::Descriptor => 2,
+                RootType::ImmediateSampler => 0,
+                _ => return Err("an FSPX resource of an unknown root type"),
+            };
+            if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
+                layout.push(RootParam {
+                    root,
+                    table_offset_dwords: 0,
+                    sgprs,
+                    base_register: u.lower_bound,
+                    user_data: u.user_data,
+                    slot: u.slot,
+                });
+            }
+            used.push(u);
+        }
+        Ok((layout, used))
+    }
+
+    /// An `ACCC` part with a packet, `code_dwords` dwords of code and the
+    /// given metadata records (after the 0x18-byte metadata header).
+    fn fspx_part(wave32: bool, records: &[u8], code_dwords: u32) -> Vec<u8> {
+        let mut packet = vec![0u8; 0x1c];
+        packet[0x0c..0x0e].copy_from_slice(&8u16.to_le_bytes());
+        packet[0x0e..0x10].copy_from_slice(&4u16.to_le_bytes());
+        packet[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());
+        let flags: u16 = if wave32 { PACKET_WAVE32 } else { 0 };
+        packet[PACKET_FLAGS..PACKET_FLAGS + 2].copy_from_slice(&flags.to_le_bytes());
+        packet[PACKET_RSRC1..PACKET_RSRC1 + 4].copy_from_slice(&5u32.to_le_bytes());
+        packet[PACKET_RSRC2..PACKET_RSRC2 + 4].copy_from_slice(&0x1234u32.to_le_bytes());
+        let code: Vec<u8> = (0..code_dwords * 4).map(|i| i as u8).collect();
+        let mut meta = vec![0u8; FSPX_RECORDS];
+        meta[8..12].copy_from_slice(&code_dwords.to_le_bytes());
+        meta.extend_from_slice(records);
+        let mut part = vec![0u8; FSPX_HEADER + 48];
+        part[0..4].copy_from_slice(b"FSPX");
+        part[4..8].copy_from_slice(&FSPX_VERSION.to_le_bytes());
+        part[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let mut at = part.len();
+        for (i, (kind, body)) in [
+            (FSPX_PACKET, &packet),
+            (FSPX_CODE, &code),
+            (FSPX_METADATA, &meta),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let h = FSPX_HEADER + 16 * i;
+            part[h..h + 4].copy_from_slice(&kind.to_le_bytes());
+            part[h + 4..h + 8].copy_from_slice(&(at as u32).to_le_bytes());
+            part[h + 8..h + 12].copy_from_slice(&(body.len() as u32).to_le_bytes());
+            part.extend_from_slice(body);
+            at += body.len();
+        }
+        part
+    }
+
+    /// One 32-byte record with the fields `fspx_program` reads.
+    fn record(tag: u8, kind: u8, root: u8, fields: [u32; 3], tail: [u8; 3]) -> [u8; 32] {
+        let mut e = [0u8; 32];
+        e[0] = tag;
+        e[4] = kind;
+        e[5] = root;
+        e[8..12].copy_from_slice(&fields[0].to_le_bytes());
+        e[12..16].copy_from_slice(&fields[1].to_le_bytes());
+        e[16..20].copy_from_slice(&fields[2].to_le_bytes());
+        e[20..23].copy_from_slice(&tail);
+        e
+    }
+
+    #[test]
+    fn fspx_program_reads_a_part_as_it_always_did() {
+        let mut recs = Vec::new();
+        recs.extend_from_slice(&record(0x41, 0, 3, [4, 7, 99], [1, 0, 2]));
+        // a sampler declaration is skipped, as is whatever it holds
+        recs.extend_from_slice(&record(0x42, 1, 3, [0, 7, 0], [0, 0, 0]));
+        recs.extend_from_slice(&record(0x41, 3, 1, [0, 2, 55], [2, 2, 3]));
+        recs.extend_from_slice(&record(0x41, 9, 4, [0, 5, 0], [0, 0, 1]));
+        recs.extend_from_slice(&record(0x43, 0, 0, [0; 3], [0; 3]));
+        // nothing after the hash record is looked at
+        recs.extend_from_slice(&record(0x77, 0, 0, [0; 3], [0; 3]));
+        let part = fspx_part(true, &recs, 3);
+        let p = fspx_program(&part).unwrap();
+        let (layout, used) = old_records(&recs).unwrap();
+        assert_eq!(p.layout, layout);
+        assert_eq!(p.used, used);
+        assert_eq!(p.used.len(), 3);
+        assert!(p.used.iter().all(|u| u.stride == 0));
+        assert_eq!(p.layout.len(), 2);
+        assert_eq!(p.stage, HwStage::Cs);
+        assert!(!p.wave64);
+        assert_eq!(p.vgprs, 48);
+        assert_eq!(p.code.len(), 12);
+        match p.io {
+            StageIo::Cs(c) => {
+                assert_eq!(c.rsrc2, 0x1234);
+                assert_eq!(c.threads, [8, 4, 2]);
+            }
+            _ => panic!("not a compute program"),
+        }
+    }
+
+    #[test]
+    fn fspx_program_still_refuses_root_constants_and_unknown_records() {
+        // root constants are an error here whatever the pieces parser takes
+        let consts = record(0x41, 2, 0, [0, 0, 4], [1, 0, 0]);
+        let part = fspx_part(false, &consts, 1);
+        assert!(matches!(
+            fspx_program(&part),
+            Err(Malformed("an FSPX resource of an unknown root type"))
+        ));
+        let odd = record(0x44, 0, 0, [0; 3], [0; 3]);
+        let part = fspx_part(false, &odd, 1);
+        assert!(matches!(
+            fspx_program(&part),
+            Err(Malformed("unknown FSPX metadata record"))
+        ));
+        // a short tail and a missing record area are not records at all
+        let mut short = record(0x41, 0, 3, [0, 1, 0], [1, 0, 0]).to_vec();
+        short.extend_from_slice(&[0x99; 31]);
+        let part = fspx_part(false, &short, 1);
+        assert_eq!(fspx_program(&part).unwrap().used.len(), 1);
+        assert!(fspx_program(&fspx_part(false, &[], 1)).unwrap().used.is_empty());
+    }
+
+    #[test]
+    fn fspx_records_match_the_old_loop_on_any_stream() {
+        // a fixed xorshift stream: random tags, kinds, roots and slots, with
+        // a partial record on the end half the time
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..4000 {
+            let n = (next() % 8) as usize;
+            let mut data = Vec::new();
+            for _ in 0..n {
+                let mut e = [0u8; 32];
+                for b in e.iter_mut() {
+                    *b = next() as u8;
+                }
+                e[0] = [0x41, 0x41, 0x41, 0x42, 0x43, 0x40, 0x00][(next() % 7) as usize];
+                e[4] = (next() % 6) as u8;
+                e[5] = (next() % 8) as u8;
+                e[22] = (next() % 3) as u8;
+                data.extend_from_slice(&e);
+            }
+            if next() & 1 == 0 {
+                data.extend((0..(next() % 31)).map(|_| next() as u8));
+            }
+            let new = records(
+                &data,
+                RecordRules {
+                    constants: false,
+                    strides: false,
+                },
+            );
+            match (old_records(&data), new) {
+                (Ok((layout, used)), Ok(r)) => {
+                    assert_eq!(layout, r.layout);
+                    assert_eq!(used, r.used);
+                }
+                (Err(a), Err(Malformed(b))) => assert_eq!(a, b),
+                _ => panic!("the readers disagree on {data:?}"),
+            }
+        }
     }
 }
