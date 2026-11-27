@@ -5853,7 +5853,6 @@ impl Host {
         // What the copy sets of these lists are, before the card steps' list
         // is put in front (`VICTORY_REFRESH_SET`).
         sets::begin(runs, parts);
-        let _memo = crate::watch::commit_memo::Epoch::begin();
         // Upscalings these lists recorded, in submission order: the next
         // present tags the latest (frame generation).
         for run in runs {
