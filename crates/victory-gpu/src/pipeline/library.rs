@@ -529,6 +529,25 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
+        // An empty library is asked for with a null blob: the binding hands
+        // over `[].as_ptr()`, a dangling non-null pointer, and vkd3d-proton
+        // refuses a non-null blob of length 0 with E_INVALIDARG
+        // (`d3d12_pipeline_library_init`), so under Proton no library was
+        // ever made and every run made every host pipeline again.
+        if bytes.is_empty() {
+            let mut out = std::ptr::null_mut();
+            // SAFETY: the device's own method, a null blob of length 0.
+            return unsafe {
+                (Interface::vtable(device).CreatePipelineLibrary)(
+                    Interface::as_raw(device),
+                    std::ptr::null(),
+                    0,
+                    &ID3D12PipelineLibrary1::IID,
+                    &mut out,
+                )
+                .and_then(|| windows::core::Type::from_abi(out))
+            };
+        }
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
