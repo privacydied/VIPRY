@@ -26,7 +26,7 @@ pub mod console;
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 mod memory_map;
 #[cfg(windows)]
 mod cores;

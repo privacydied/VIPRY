@@ -9433,6 +9433,8 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        #[cfg(not(feature = "diagnostics"))]
+        crate::memory_map::line();
         upq::line(frames);
         rec::line(frames);
         crate::queue::behind_line(frames);

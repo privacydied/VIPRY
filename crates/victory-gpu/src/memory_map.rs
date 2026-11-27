@@ -8,6 +8,7 @@ use std::collections::HashMap;
 /// Whether the address space is walked for the memory map line
 /// ([`log`]). On by default (this module is in diagnostics
 /// builds only); `VICTORY_MEMORY_MAP=0` leaves the walk out.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MAP").is_none_or(|v| v != "0"))
@@ -196,4 +197,69 @@ pub(crate) fn log() {
         groups.len(),
         biggest.join("; ")
     );
+}
+
+/// Whether a walk runs now (one at a time).
+#[cfg(not(feature = "diagnostics"))]
+static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Release builds, `VICTORY_MEMORY_MAP=1` (off by default): with the
+/// frame-rate line, every 30 s the process's private bytes and working set
+/// and the PC's free memory, and every 60 s the map above, on a thread of its
+/// own. Diagnostics builds print both with their memory line instead.
+#[cfg(not(feature = "diagnostics"))]
+pub(crate) fn line() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_MEMORY_MAP")) {
+        return;
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    /// The last half minute a line was printed for, plus one (0: none yet).
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let half_minutes = START.get_or_init(std::time::Instant::now).elapsed().as_secs() / 30 + 1;
+    if LAST.swap(half_minutes, Relaxed) == half_minutes {
+        return;
+    }
+    let (working, private) = process();
+    let (free, left) = system();
+    tracing::info!(
+        "memory: private {} MB, working set {} MB; the PC: {} MB free, {} MB left to commit",
+        private >> 20,
+        working >> 20,
+        free >> 20,
+        left >> 20
+    );
+    if half_minutes % 2 == 0 && !WALKING.swap(true, Relaxed) {
+        let walk = std::thread::Builder::new().name("victory-memory-map".into()).spawn(|| {
+            log();
+            WALKING.store(false, Relaxed);
+        });
+        if walk.is_err() {
+            WALKING.store(false, Relaxed);
+        }
+    }
+}
+
+/// The process's working set and private bytes.
+#[cfg(not(feature = "diagnostics"))]
+fn process() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    (c.WorkingSetSize as u64, c.PagefileUsage as u64)
+}
+
+/// The PC's physical memory free, and what is left to commit.
+#[cfg(not(feature = "diagnostics"))]
+fn system() -> (u64, u64) {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    unsafe { GlobalMemoryStatusEx(&mut m) };
+    (m.ullAvailPhys, m.ullAvailPageFile)
 }
