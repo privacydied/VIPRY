@@ -722,7 +722,7 @@ fn hand_out(
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
-    make::early(&host);
+    let host = make::early(host);
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]

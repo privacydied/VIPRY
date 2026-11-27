@@ -11,6 +11,10 @@
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
 //!    creation, during loading.
+//! 3. With `VICTORY_PIPELINE_WARMUP=1`, a run saves the source containers
+//!    and graphics state of requested pipelines. On the next launch a
+//!    reader feeds these recipes to the workers, most used first. A change
+//!    to the translator rebuilds from the original containers.
 //!
 //! Library calls overlap: the host documents the library as safe to use
 //! from several threads ("The pipeline library is thread-safe to use, and
@@ -47,10 +51,13 @@
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
+
+use super::make::Pending;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -440,6 +447,7 @@ pub(crate) fn removal_note() -> String {
 /// (hundreds of thousands of pages), once after each burst of loads.
 /// `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them.
 pub(crate) fn trim() {
+    report_warmup();
     static ON: OnceLock<bool> = OnceLock::new();
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
     if at == 0
@@ -677,6 +685,11 @@ pub(crate) fn save(now: bool) {
             return;
         }
         *last = Some(std::time::Instant::now());
+        if warm_enabled()
+            && let Err(error) = save_warm(dir)
+        {
+            tracing::warn!(%error, "pipeline warm-up recipes could not be saved");
+        }
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
@@ -876,9 +889,571 @@ pub(crate) fn note_used(key: &str) {
     }
 }
 
+pub(super) fn warm_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    DIR.get().is_some()
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WARMUP").is_some_and(|v| v == "1"))
+}
+
+/// Approach after XCL 354ce0c: record the pipelines requested by a bind.
+/// The old early list held 2,752 keys, but a key alone cannot start a build
+/// before the title creates the object. Keep the construction inputs and
+/// rank them by host pipeline lookups during the last recorded run.
+struct WarmEntry {
+    pipeline: Arc<Pending>,
+    calls: Arc<AtomicU64>,
+    stored: AtomicBool,
+}
+
+fn catalog() -> &'static Mutex<HashMap<String, Arc<WarmEntry>>> {
+    static CATALOG: OnceLock<Mutex<HashMap<String, Arc<WarmEntry>>>> = OnceLock::new();
+    CATALOG.get_or_init(Mutex::default)
+}
+
+fn register(p: Arc<Pending>) -> Arc<WarmEntry> {
+    let mut table = catalog().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = table.get(&p.key) {
+        return entry.clone();
+    }
+    let entry = Arc::new(WarmEntry {
+        pipeline: p,
+        calls: Arc::new(AtomicU64::new(0)),
+        stored: AtomicBool::new(false),
+    });
+    if table.len() < EARLY_MAX {
+        table.insert(entry.pipeline.key.clone(), entry.clone());
+    }
+    entry
+}
+
+pub(super) fn shared(p: Arc<Pending>) -> Arc<Pending> {
+    let entry = register(p.clone());
+    if Arc::ptr_eq(&p, &entry.pipeline) || !p.same_inputs(&entry.pipeline) {
+        p
+    } else {
+        entry.pipeline.clone()
+    }
+}
+
+pub(super) fn replayed(p: &Pending) -> Option<Arc<Pending>> {
+    let previous = catalog()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&p.key)?
+        .pipeline
+        .clone();
+    p.same_inputs(&previous).then_some(previous)
+}
+
+pub(super) struct Usage {
+    pub(super) calls: Arc<AtomicU64>,
+    pub(super) shared: Option<Arc<Pending>>,
+}
+
+/// A title can create its object while the reader is still opening its
+/// saved recipe. Whichever object registered first owns the build. Only
+/// the other object retains it, so the owner never holds its own Arc.
+pub(super) fn usage(p: &Arc<Pending>) -> Usage {
+    let entry = register(p.clone());
+    let shared = (!Arc::ptr_eq(p, &entry.pipeline) && p.same_inputs(&entry.pipeline))
+        .then(|| entry.pipeline.clone());
+    Usage {
+        calls: entry.calls.clone(),
+        shared,
+    }
+}
+
+const RECIPE_DIR: &str = "warm-v1";
+const ORDER_FILE: &str = "order.txt";
+const STAGES: [&str; 8] = [
+    "vertex",
+    "pixel",
+    "compute",
+    "mesh",
+    "amplification",
+    "geometry",
+    "hull",
+    "domain",
+];
+
+fn invalid() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid pipeline recipe")
+}
+
+fn read_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > limit as u64 {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(invalid());
+    }
+    Ok(bytes)
+}
+
+fn ranking(dir: &Path) -> io::Result<Vec<(String, u64)>> {
+    let bytes = match read_bounded(&dir.join(ORDER_FILE), 1 << 20) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        result => result?,
+    };
+    let mut rows = HashMap::new();
+    for line in std::str::from_utf8(&bytes).map_err(|_| invalid())?.lines() {
+        let Some((count, key)) = line.split_once(' ') else {
+            continue;
+        };
+        if key.len() == 32
+            && key.bytes().all(|b| b.is_ascii_hexdigit())
+            && let Ok(count) = count.parse::<u64>()
+        {
+            rows.insert(key.to_owned(), count);
+        }
+    }
+    Ok(rank(rows))
+}
+
+fn rank(rows: HashMap<String, u64>) -> Vec<(String, u64)> {
+    let mut rows: Vec<_> = rows.into_iter().collect();
+    rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.truncate(EARLY_MAX);
+    rows
+}
+
+/// Save complete inputs before publishing their key in the order file.
+/// Each distinct shader container takes space once across all recipes.
+fn write_recipe(dir: &Path, p: &Pending, shaders: &mut HashSet<blake3::Hash>) -> io::Result<()> {
+    let count = u8::try_from(p.shaders.len()).map_err(|_| invalid())?;
+    if count == 0 || usize::from(count) > STAGES.len() {
+        return Err(invalid());
+    }
+    let mut bytes = vec![count];
+    for s in &p.shaders {
+        let kind = STAGES
+            .iter()
+            .position(|&kind| kind == s.stage)
+            .ok_or_else(invalid)?;
+        let hash = blake3::hash(&s.container);
+        if !shaders.contains(&hash) {
+            publish(&dir.join(hash.to_hex().as_str()), &s.container)?;
+            shaders.insert(hash);
+        }
+        bytes.push(kind as u8);
+        bytes.extend_from_slice(hash.as_bytes());
+    }
+    if let Some(g) = &p.graphics {
+        bytes.extend(g.cache_bytes(false));
+    }
+    let checksum = blake3::hash(&bytes);
+    bytes.extend_from_slice(checksum.as_bytes());
+    publish(&dir.join(&p.key), &bytes)
+}
+
+fn publish(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(tmp, path)
+}
+
+fn read_recipe(
+    dir: &Path,
+    key: &str,
+    verified: &mut HashMap<blake3::Hash, Arc<super::Shader>>,
+) -> io::Result<Pending> {
+    let file = read_bounded(&dir.join(key), 1 << 20)?;
+    let (mut bytes, checksum) = file.split_last_chunk::<32>().ok_or_else(invalid)?;
+    if blake3::hash(bytes).as_bytes() != checksum {
+        return Err(invalid());
+    }
+    let count = usize::from(*bytes.split_off_first().ok_or_else(invalid)?);
+    if count == 0 || count > STAGES.len() {
+        return Err(invalid());
+    }
+    let mut shaders = Vec::with_capacity(count);
+    for _ in 0..count {
+        let kind = *bytes.split_off_first().ok_or_else(invalid)? as usize;
+        let stage = *STAGES.get(kind).ok_or_else(invalid)?;
+        let digest = *bytes
+            .split_off(..32)
+            .and_then(<[u8]>::as_array::<32>)
+            .ok_or_else(invalid)?;
+        let hash = blake3::Hash::from_bytes(digest);
+        let shader = match verified.get(&hash) {
+            Some(shader) => shader.clone(),
+            None => {
+                let source = read_bounded(&dir.join(hash.to_hex().as_str()), 64 << 20)?;
+                if blake3::hash(&source) != hash {
+                    return Err(invalid());
+                }
+                let shader = super::shader(stage, &source);
+                verified.insert(hash, shader.clone());
+                shader
+            }
+        };
+        if shader.stage != stage {
+            return Err(invalid());
+        }
+        shaders.push(shader);
+    }
+    let graphics = if bytes.is_empty() {
+        None
+    } else {
+        Some(Box::new(
+            super::host::GraphicsState::from_cache(bytes).ok_or_else(invalid)?,
+        ))
+    };
+    let p = Pending::new(shaders, graphics);
+    if p.key != key {
+        return Err(invalid());
+    }
+    Ok(p)
+}
+
+static RESTORED: AtomicU64 = AtomicU64::new(0);
+static UNREADABLE: AtomicU64 = AtomicU64::new(0);
+
+/// Start at the first title pipeline creation, after the shader cache and
+/// device configuration are in place. File reads and compilation run off
+/// the recording threads. A live request can promote a replay already queued.
+pub(super) fn start_warmup() {
+    static START: std::sync::Once = std::sync::Once::new();
+    let Some(dir) = DIR.get() else { return };
+    START.call_once(|| {
+        let dir = dir.join(RECIPE_DIR);
+        let worker = std::thread::Builder::new()
+            .name("victory-pipeline-warmup".into())
+            .spawn(move || {
+                let rows = match ranking(&dir) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        tracing::warn!(%error, "pipeline warm-up order unreadable");
+                        return;
+                    }
+                };
+                let mut verified = HashMap::new();
+                for (key, count) in rows {
+                    if count == 0 {
+                        break;
+                    }
+                    match read_recipe(&dir, &key, &mut verified) {
+                        Ok(p) => {
+                            let entry = register(Arc::new(p));
+                            entry.stored.store(true, Ordering::Relaxed);
+                            super::make::replay(&entry.pipeline);
+                            RESTORED.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            UNREADABLE.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                tracing::info!(
+                    restored = RESTORED.load(Ordering::Relaxed),
+                    unreadable = UNREADABLE.load(Ordering::Relaxed),
+                    "pipeline warm-up recipes queued"
+                );
+            });
+        if let Err(error) = worker {
+            tracing::warn!(%error, "pipeline warm-up reader unavailable");
+        }
+    });
+}
+
+fn save_warm(cache: &Path) -> io::Result<()> {
+    let entries: Vec<_> = catalog()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|e| e.calls.load(Ordering::Relaxed) != 0)
+        .cloned()
+        .collect();
+    if entries.is_empty() {
+        return Ok(());
+    }
+    save_entries(&cache.join(RECIPE_DIR), entries)
+}
+
+fn save_entries(dir: &Path, entries: Vec<Arc<WarmEntry>>) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let prior = match ranking(dir) {
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => Vec::new(),
+        result => result?,
+    };
+    // An entry unseen this run remains available behind every observed one.
+    let mut rows: HashMap<_, _> = prior.into_iter().map(|(key, _)| (key, 0)).collect();
+    let mut shaders = HashSet::new();
+    for entry in entries {
+        let p = &entry.pipeline;
+        if !entry.stored.load(Ordering::Relaxed) {
+            if p.shaders.is_empty() {
+                continue;
+            }
+            match write_recipe(dir, p, &mut shaders) {
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
+                result => result?,
+            }
+            entry.stored.store(true, Ordering::Relaxed);
+        }
+        rows.insert(p.key.clone(), entry.calls.load(Ordering::Relaxed));
+    }
+    use std::fmt::Write;
+    let mut out = String::new();
+    for (key, count) in rank(rows) {
+        writeln!(out, "{count} {key}").unwrap();
+    }
+    publish(&dir.join(ORDER_FILE), out.as_bytes())
+}
+
+fn report_warmup() {
+    use super::make::{REPLAY_LATE, REPLAY_READY, STANDIN_HITS, STANDIN_MISSES};
+    let counts = [
+        &RESTORED,
+        &UNREADABLE,
+        &REPLAY_READY,
+        &REPLAY_LATE,
+        &STANDIN_HITS,
+        &STANDIN_MISSES,
+    ]
+    .map(|n| n.load(Ordering::Relaxed));
+    if counts == [0; 6] {
+        return;
+    }
+    static LAST: Mutex<[u64; 6]> = Mutex::new([0; 6]);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != counts {
+        *last = counts;
+        let [
+            restored,
+            unreadable,
+            ready_at_first_use,
+            late_at_first_use,
+            standin_hits,
+            standin_misses,
+        ] = counts;
+        tracing::info!(
+            restored,
+            unreadable,
+            ready_at_first_use,
+            late_at_first_use,
+            standin_hits,
+            standin_misses,
+            "pipeline warm-up and stand-in lookups"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_order_uses_frequency_and_ignores_invalid_cache_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
+        std::fs::write(
+            dir.path().join(ORDER_FILE),
+            format!(
+                "2 {b}\n80 {c}\n2 {a}\n50 ../wrong\n1 {}\nbad {a}",
+                "x".repeat(32)
+            ),
+        )
+        .unwrap();
+        assert_eq!(ranking(dir.path()).unwrap(), vec![(c, 80), (a, 2), (b, 2)]);
+    }
+
+    #[test]
+    fn replay_and_title_creation_share_one_build_in_either_order() {
+        for (replay_first, source) in [
+            (true, b"synthetic replay first".as_slice()),
+            (false, b"synthetic title first"),
+        ] {
+            let s = super::super::shader("compute", source);
+            let make = || Arc::new(Pending::new(vec![s.clone()], None));
+            let (title, replay) = (make(), make());
+            let (binding, canonical) = if replay_first {
+                let canonical = shared(replay.clone());
+                let binding = usage(&title);
+                assert!(Arc::ptr_eq(binding.shared.as_ref().unwrap(), &replay));
+                (binding, canonical)
+            } else {
+                let binding = usage(&title);
+                let canonical = shared(replay.clone());
+                assert!(binding.shared.is_none());
+                assert!(Arc::ptr_eq(&canonical, &title));
+                (binding, canonical)
+            };
+            binding.calls.fetch_add(2, Ordering::Relaxed);
+            assert_eq!(usage(&canonical).calls.load(Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn warm_save_replays_the_last_runs_frequent_inputs_first() {
+        let folder = tempfile::tempdir().unwrap();
+        let dir = folder.path();
+        let entry = |source: &[u8], calls| {
+            Arc::new(WarmEntry {
+                pipeline: Arc::new(Pending::new(
+                    vec![super::super::shader("compute", source)],
+                    None,
+                )),
+                calls: Arc::new(AtomicU64::new(calls)),
+                stored: AtomicBool::new(false),
+            })
+        };
+        let hot = entry(b"synthetic frequently used compute", 240);
+        let cold = entry(b"synthetic rarely used compute", 3);
+        save_entries(dir, vec![cold.clone(), hot.clone()]).unwrap();
+        let rows = ranking(dir).unwrap();
+        assert_eq!(
+            rows,
+            [
+                (hot.pipeline.key.clone(), 240),
+                (cold.pipeline.key.clone(), 3)
+            ]
+        );
+        let mut verified = HashMap::new();
+        for (key, _) in rows {
+            assert_eq!(read_recipe(dir, &key, &mut verified).unwrap().key, key);
+        }
+        cold.calls.store(5, Ordering::Relaxed);
+        save_entries(dir, vec![cold.clone()]).unwrap();
+        assert_eq!(
+            ranking(dir).unwrap(),
+            [
+                (cold.pipeline.key.clone(), 5),
+                (hot.pipeline.key.clone(), 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn recipes_restore_shader_inputs_and_reject_incomplete_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        // Construct outside the intern table so the reader must open and
+        // verify the shader file, just as a fresh process does.
+        let source = b"synthetic pipeline recipe vertex";
+        let hash = blake3::hash(source);
+        let shader = Arc::new(super::super::Shader {
+            stage: "vertex",
+            container: source.to_vec(),
+            hash: hash.to_hex()[..16].to_owned(),
+            ambient: None,
+            translated: OnceLock::new(),
+        });
+        let p = Pending::new(vec![shader], Some(Box::default()));
+        write_recipe(dir.path(), &p, &mut HashSet::new()).unwrap();
+        let file = dir.path().join(hash.to_hex().as_str());
+        std::fs::write(&file, b"damaged").unwrap();
+        let mut verified = HashMap::new();
+        assert!(read_recipe(dir.path(), &p.key, &mut verified).is_err());
+        std::fs::write(file, source).unwrap();
+        let restored = read_recipe(dir.path(), &p.key, &mut verified).unwrap();
+        assert_eq!(restored.shaders[0].container, source);
+        assert_eq!(p.key, restored.key);
+        let file = dir.path().join(&p.key);
+        let bytes = std::fs::read(&file).unwrap();
+        std::fs::write(file, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(read_recipe(dir.path(), &p.key, &mut verified).is_err());
+    }
+
+    /// A fresh process has its own driver, worker pool and cache directory.
+    /// Its first, unrelated creation must suffice to build the saved pipeline.
+    #[test]
+    fn startup_builds_the_saved_pipeline_before_its_title_object_exists() {
+        const CHILD: &str = "VICTORY_TEST_PIPELINE_RESTART_DIR";
+        const SOURCE: &[u8] = b"synthetic restart compute stage";
+        let shader = super::super::shader("compute", SOURCE);
+        if let Some(dir) = std::env::var_os(CHILD) {
+            use super::super::make;
+            use std::time::{Duration, Instant};
+            use windows::core::s;
+
+            let has_device = crate::host::host().is_some();
+            if has_device {
+                let dxil = crate::host::compile(
+                    "[numthreads(1,1,1)] void main() {}",
+                    s!("main"),
+                    s!("cs_5_1"),
+                )
+                .unwrap();
+                let host = victory_shader::emit::HostShader {
+                    stage: victory_shader::HwStage::Cs,
+                    dxil,
+                    user_data: vec![],
+                    root_cbvs: vec![],
+                    root_srvs: vec![],
+                    root_uavs: vec![],
+                    root_indexed_views: vec![],
+                    samplers: vec![],
+                    static_samplers: vec![],
+                };
+                assert!(
+                    shader
+                        .translated
+                        .set(Some(super::super::Translated {
+                            host,
+                            threads: None,
+                            used: vec![],
+                            tables: crate::draw::TablePlan::new(&[], &[]),
+                            stores: false,
+                            stores_by_address: false,
+                            picks: Default::default(),
+                        }))
+                        .is_ok()
+                );
+            }
+            use_pipeline_cache(dir.into());
+            make::early(Arc::new(Pending::new(Vec::new(), None)));
+            let title = || Arc::new(Pending::new(vec![shader.clone()], None));
+            let enabled = std::env::var_os("VICTORY_PIPELINE_WARMUP").is_some_and(|v| v == "1");
+            assert_eq!(warm_enabled(), enabled);
+            if !enabled {
+                assert!(replayed(&title()).is_none());
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while RESTORED.load(Ordering::Relaxed) == 0 || make::waiting() != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "saved pipeline did not finish during startup"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let title = title();
+            let restored = replayed(&title).expect("built before the title asked");
+            let live = make::early(title);
+            assert!(Arc::ptr_eq(&restored, &live));
+            if has_device {
+                assert!(make::ready(&live).is_some());
+            }
+            return;
+        }
+
+        let folder = tempfile::tempdir().unwrap();
+        let entry = Arc::new(WarmEntry {
+            pipeline: Arc::new(Pending::new(vec![shader], None)),
+            calls: Arc::new(AtomicU64::new(10)),
+            stored: AtomicBool::new(false),
+        });
+        save_entries(&folder.path().join(RECIPE_DIR), vec![entry]).unwrap();
+        let test = "pipeline::library::tests::startup_builds_the_saved_pipeline_before_its_title_object_exists";
+        for switch in ["0", "1"] {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env(CHILD, folder.path())
+                .env("VICTORY_PIPELINE_WARMUP", switch)
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "restart with warm-up {switch}: {} {}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(String::from_utf8_lossy(&child.stdout).contains("1 passed"));
+        }
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

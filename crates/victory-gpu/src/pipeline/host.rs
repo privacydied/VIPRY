@@ -331,6 +331,190 @@ impl GraphicsState {
     }
 }
 
+// The cache contains scalar values and semantic strings. Native descriptors
+// also contain padding and process-local pointers, which cannot be replayed.
+macro_rules! graphics_fields {
+    ($g:ident, $field:ident) => {{
+        $field!(
+            $g.blend.AlphaToCoverageEnable.0,
+            $g.blend.IndependentBlendEnable.0
+        );
+        for t in &mut $g.blend.RenderTarget {
+            $field!(
+                t.BlendEnable.0,
+                t.LogicOpEnable.0,
+                t.SrcBlend.0,
+                t.DestBlend.0,
+                t.BlendOp.0,
+                t.SrcBlendAlpha.0,
+                t.DestBlendAlpha.0,
+                t.BlendOpAlpha.0,
+                t.LogicOp.0,
+                t.RenderTargetWriteMask
+            );
+        }
+        let r = &mut $g.rasterizer;
+        $field!(
+            $g.sample_mask,
+            r.FillMode.0,
+            r.CullMode.0,
+            r.FrontCounterClockwise.0,
+            r.DepthBias,
+            r.DepthBiasClamp,
+            r.SlopeScaledDepthBias,
+            r.DepthClipEnable.0,
+            r.MultisampleEnable.0,
+            r.AntialiasedLineEnable.0,
+            r.ForcedSampleCount,
+            r.ConservativeRaster.0
+        );
+        let d = &mut $g.depth;
+        $field!(
+            d.DepthEnable.0,
+            d.DepthWriteMask.0,
+            d.DepthFunc.0,
+            d.StencilEnable.0,
+            d.StencilReadMask,
+            d.StencilWriteMask
+        );
+        for face in [&mut d.FrontFace, &mut d.BackFace] {
+            $field!(
+                face.StencilFailOp.0,
+                face.StencilDepthFailOp.0,
+                face.StencilPassOp.0,
+                face.StencilFunc.0
+            );
+        }
+        $field!($g.strip_cut.0, $g.topology.0, $g.targets.NumRenderTargets);
+        for format in &mut $g.targets.RTFormats {
+            $field!(format.0);
+        }
+        $field!($g.depth_format.0, $g.samples.Count, $g.samples.Quality);
+    }};
+}
+
+macro_rules! input_fields {
+    ($e:ident, $field:ident) => {
+        $field!(
+            $e.SemanticIndex,
+            $e.Format.0,
+            $e.InputSlot,
+            $e.AlignedByteOffset,
+            $e.InputSlotClass.0,
+            $e.InstanceDataStepRate
+        );
+    };
+}
+
+trait CacheScalar {
+    fn read(&mut self, bytes: &mut &[u8]) -> Option<()>;
+}
+
+macro_rules! cache_scalars {
+    ($($t:ty),*) => { $(impl CacheScalar for $t {
+        fn read(&mut self, bytes: &mut &[u8]) -> Option<()> {
+            *self = Self::from_le_bytes(*bytes.split_off(..size_of::<Self>())?.as_array()?);
+            Some(())
+        }
+    })* };
+}
+cache_scalars!(u8, u32, i32, f32);
+
+impl GraphicsState {
+    pub(super) fn cache_bytes(&self, compatible: bool) -> Vec<u8> {
+        let mut g = GraphicsState {
+            blend: self.blend,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            depth_bounds: self.depth_bounds,
+            inputs: Vec::new(),
+            names: Vec::new(),
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets: self.targets,
+            depth_format: self.depth_format,
+            samples: self.samples,
+        };
+        if compatible {
+            // D3D12 ignores the remaining blend slots with independent blending
+            // disabled, and the formats beyond the last color attachment.
+            let targets = (g.targets.NumRenderTargets as usize).min(8);
+            let blend_slots = if g.blend.IndependentBlendEnable.as_bool() {
+                targets
+            } else {
+                targets.min(1)
+            };
+            g.blend.RenderTarget[blend_slots..].fill(Default::default());
+            g.targets.RTFormats[targets..].fill(DXGI_FORMAT_UNKNOWN);
+            if !g.depth.DepthEnable.as_bool() {
+                g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+                g.depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            }
+            if !g.depth.StencilEnable.as_bool() {
+                g.depth.StencilReadMask = 0;
+                g.depth.StencilWriteMask = 0;
+                g.depth.FrontFace = Default::default();
+                g.depth.BackFace = Default::default();
+            }
+            for t in &mut g.blend.RenderTarget[..blend_slots] {
+                if !t.BlendEnable.as_bool() {
+                    t.SrcBlend = D3D12_BLEND_ONE;
+                    t.DestBlend = D3D12_BLEND_ZERO;
+                    t.BlendOp = D3D12_BLEND_OP_ADD;
+                    t.SrcBlendAlpha = D3D12_BLEND_ONE;
+                    t.DestBlendAlpha = D3D12_BLEND_ZERO;
+                    t.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+                }
+                if !t.LogicOpEnable.as_bool() {
+                    t.LogicOp = D3D12_LOGIC_OP_NOOP;
+                }
+            }
+        }
+        let mut bytes = vec![u8::from(g.depth_bounds)];
+        macro_rules! put {
+            ($($v:expr),+) => { $(bytes.extend_from_slice(&$v.to_le_bytes());)+ };
+        }
+        graphics_fields!(g, put);
+        put!(self.inputs.len() as u32);
+        for (e, name) in self.inputs.iter().zip(&self.names) {
+            input_fields!(e, put);
+            put!(name.as_bytes().len() as u32);
+            bytes.extend_from_slice(name.as_bytes());
+        }
+        bytes
+    }
+
+    pub(super) fn from_cache(mut bytes: &[u8]) -> Option<Self> {
+        let mut g = Self::default();
+        g.depth_bounds = match bytes.split_off_first()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        macro_rules! get {
+            ($($v:expr),+) => { $($v.read(&mut bytes)?;)+ };
+        }
+        graphics_fields!(g, get);
+        let mut count = 0u32;
+        get!(count);
+        if count > 32 || g.targets.NumRenderTargets > 8 {
+            return None;
+        }
+        for _ in 0..count {
+            let mut e = D3D12_INPUT_ELEMENT_DESC::default();
+            input_fields!(e, get);
+            let mut len = 0u32;
+            get!(len);
+            let name = CString::new(bytes.split_off(..len as usize)?).ok()?;
+            e.SemanticName = PCSTR(name.as_ptr().cast());
+            g.names.push(name);
+            g.inputs.push(e);
+        }
+        bytes.is_empty().then_some(g)
+    }
+}
+
 /// One input element: vertex buffer slot, byte offset, format.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Input {
@@ -1207,6 +1391,69 @@ mod tests {
         let mut t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
+    }
+
+    #[test]
+    fn recipe_restores_owned_input_names_and_exact_graphics_state() {
+        let mut g = GraphicsState::default();
+        let name = CString::new("POSITION").unwrap();
+        g.inputs.push(D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(name.as_ptr().cast()),
+            SemanticIndex: 3,
+            InputSlot: 2,
+            Format: DXGI_FORMAT_R32_FLOAT,
+            AlignedByteOffset: D3D12_APPEND_ALIGNED_ELEMENT,
+            ..Default::default()
+        });
+        g.names.push(name);
+        g.rasterizer.SlopeScaledDepthBias = -1.25;
+        g.depth_bounds = true;
+        g.blend.RenderTarget[4].RenderTargetWriteMask = 7;
+        let bytes = g.cache_bytes(false);
+        let description = g.describe();
+        drop(g);
+        let restored = GraphicsState::from_cache(&bytes).unwrap();
+        assert_eq!(description, restored.describe());
+        assert_eq!(bytes, restored.cache_bytes(false));
+        assert_eq!(
+            restored.inputs[0].SemanticName.0,
+            restored.names[0].as_ptr().cast()
+        );
+        assert!(GraphicsState::from_cache(&bytes[..bytes.len() - 1]).is_none());
+        assert!(GraphicsState::from_cache(&[bytes.as_slice(), &[0]].concat()).is_none());
+    }
+
+    #[test]
+    fn compatible_graphics_state_keeps_every_active_test_and_write() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let key = g.cache_bytes(true);
+        let exact = g.cache_bytes(false);
+        g.targets.RTFormats[4] = DXGI_FORMAT_R32_FLOAT;
+        g.blend.RenderTarget[3].RenderTargetWriteMask = 0;
+        g.blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        g.depth.StencilWriteMask = 1;
+        assert_eq!(key, g.cache_bytes(true));
+        assert_ne!(exact, g.cache_bytes(false));
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        assert_ne!(key, g.cache_bytes(true));
+        g.blend.RenderTarget[0].BlendEnable = false.into();
+        g.blend.RenderTarget[0].RenderTargetWriteMask = 0;
+        assert_ne!(key, g.cache_bytes(true));
+        g.blend.RenderTarget[0].RenderTargetWriteMask = 15;
+        g.depth_bounds = true;
+        assert_ne!(key, g.cache_bytes(true));
+        g.depth_bounds = false;
+        g.depth.StencilEnable = true.into();
+        assert_ne!(key, g.cache_bytes(true));
+        g.depth.StencilEnable = false.into();
+        g.samples.Count = 4;
+        assert_ne!(key, g.cache_bytes(true));
+        g.depth.DepthEnable = false.into();
+        let without_depth = g.cache_bytes(true);
+        g.depth.DepthFunc = D3D12_COMPARISON_FUNC_NEVER;
+        assert_eq!(without_depth, g.cache_bytes(true));
     }
 
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {

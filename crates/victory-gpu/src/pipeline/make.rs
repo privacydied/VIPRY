@@ -12,6 +12,10 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
+//! With `VICTORY_PIPELINE_STANDINS=1`, a pending graphics draw first tries
+//! a finished pipeline with the same shaders and active state. A hit binds
+//! immediately. A miss keeps the budget, including the one for one-off passes.
+//!
 //! The default budget is half a second per title frame. A pass the title
 //! runs only once and whose pipeline takes longer is lost. Passes over the
 //! screen (no vertex input, no depth) have workers and a longer budget of
@@ -21,9 +25,9 @@
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -31,7 +35,7 @@ use super::host::{GraphicsState, HostPipeline};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
-    shaders: Vec<Arc<Shader>>,
+    pub(super) shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
@@ -39,7 +43,7 @@ pub(crate) struct Pending {
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
-    key: String,
+    pub(super) key: String,
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]) or a confirmed
     /// opening-scene / bake producer that must never sit behind cold RT shaders.
@@ -48,6 +52,10 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    compatibility: OnceLock<blake3::Hash>,
+    donor: OnceLock<Arc<Pending>>,
+    usage: OnceLock<super::library::Usage>,
+    replayed: AtomicBool,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -172,6 +180,10 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            compatibility: OnceLock::new(),
+            donor: OnceLock::new(),
+            usage: OnceLock::new(),
+            replayed: AtomicBool::new(false),
         }
     }
 
@@ -179,18 +191,107 @@ impl Pending {
         &self.key
     }
 
-    fn make(&self) {
+    fn make(self: &Arc<Self>) {
         self.made.get_or_init(|| {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
+        if standins()
+            && self.left_out.is_none()
+            && self.made.get().is_some_and(Option::is_some)
+            && let Some(key) = self.compatibility()
+        {
+            donors()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, Arc::downgrade(self));
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
 }
+
+fn standins() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_STANDINS").is_some_and(|v| v == "1"))
+}
+
+/// Approach after XCL 625a0f3: share an existing driver pipeline across
+/// compatible title objects. Here the donor actually draws. The same interned
+/// shaders give it the same root bindings, resource accesses and mesh launch
+/// convention. Only state that D3D12 ignores can differ.
+impl Pending {
+    fn compatibility(&self) -> Option<blake3::Hash> {
+        let graphics = self.graphics.as_ref()?;
+        if self.shaders.is_empty()
+            || self
+                .shaders
+                .iter()
+                .any(|s| !matches!(s.stage, "vertex" | "mesh" | "pixel"))
+        {
+            return None;
+        }
+        Some(*self.compatibility.get_or_init(|| {
+            let mut hash = blake3::Hasher::new();
+            hash.update(&self.shaders.len().to_le_bytes());
+            for shader in &self.shaders {
+                hash.update(&(Arc::as_ptr(shader) as usize).to_le_bytes());
+            }
+            hash.update(&graphics.cache_bytes(true));
+            hash.finalize()
+        }))
+    }
+
+    fn standin(&self) -> Option<&HostPipeline> {
+        if let Some(real) = self.made.get() {
+            return real.as_ref();
+        }
+        let key = self.compatibility()?;
+        let donor = if let Some(p) = self.donor.get() {
+            p
+        } else {
+            let mut table = donors().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(real) = self.made.get() {
+                return real.as_ref();
+            }
+            let Some(p) = table.get(&key)?.upgrade() else {
+                table.remove(&key);
+                return None;
+            };
+            self.donor.get_or_init(|| p)
+        };
+        let host = donor.made.get()?.as_ref()?;
+        STANDIN_HITS.fetch_add(1, Ordering::Relaxed);
+        Some(host)
+    }
+
+    /// The short key in the old early list was only a scheduling hint.
+    /// Sharing a built object also requires matching the complete inputs.
+    pub(super) fn same_inputs(&self, other: &Self) -> bool {
+        self.shaders.len() == other.shaders.len()
+            && self
+                .shaders
+                .iter()
+                .zip(&other.shaders)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+            && match (&self.graphics, &other.graphics) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.cache_bytes(false) == b.cache_bytes(false),
+                _ => false,
+            }
+    }
+}
+
+fn donors() -> &'static Mutex<HashMap<blake3::Hash, Weak<Pending>>> {
+    static DONORS: OnceLock<Mutex<HashMap<blake3::Hash, Weak<Pending>>>> = OnceLock::new();
+    DONORS.get_or_init(Mutex::default)
+}
+
+pub(super) static STANDIN_HITS: AtomicU64 = AtomicU64::new(0);
+pub(super) static STANDIN_MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Why a pipeline has no host pipeline (diagnostics): left out on purpose
 /// ([`left_out`]), its shaders that do not translate, else "refused" or
@@ -202,6 +303,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     if let Some(why) = p.left_out {
         return Some(format!("left out on purpose: {why}"));
     }
+    let p = p.usage.get().and_then(|u| u.shared.as_deref()).unwrap_or(p);
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -282,13 +384,40 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         LEFT_OUT.fetch_add(1, Ordering::Relaxed);
         return None;
     }
+    let p = if super::library::warm_enabled() {
+        let usage = p.usage.get_or_init(|| super::library::usage(p));
+        usage.calls.fetch_add(1, Ordering::Relaxed);
+        usage.shared.as_ref().unwrap_or(p)
+    } else {
+        p
+    };
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        if p.replayed.load(Ordering::Relaxed) {
+            match p.made.get() {
+                Some(Some(_)) => {
+                    REPLAY_READY.fetch_add(1, Ordering::Relaxed);
+                }
+                None => {
+                    REPLAY_LATE.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(None) => {} // Reported separately by missing().
+            }
+        }
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
+        if standins() && p.compatibility().is_some() {
+            if let Some(real) = p.made.get() {
+                return real.as_ref();
+            }
+            if let Some(host) = p.standin() {
+                return Some(host);
+            }
+            STANDIN_MISSES.fetch_add(1, Ordering::Relaxed);
+        }
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
@@ -300,6 +429,12 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     if p.left_out.is_some() {
         return false;
     }
+    let p = if super::library::warm_enabled() {
+        let usage = p.usage.get_or_init(|| super::library::usage(p));
+        usage.shared.as_ref().unwrap_or(p)
+    } else {
+        p
+    };
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -307,15 +442,34 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it),
 /// or if it is a confirmed opening-scene / bake producer.
-pub(crate) fn early(p: &Arc<Pending>) {
+pub(crate) fn early(mut p: Arc<Pending>) -> Arc<Pending> {
     if p.left_out.is_some() {
-        return;
+        return p;
+    }
+    if super::library::warm_enabled() {
+        super::library::start_warmup();
     }
     if !p.shaders.is_empty() && (p.scene_input || super::library::wanted_early(&p.key)) {
+        if super::library::warm_enabled() {
+            p = super::library::shared(p);
+        }
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, if p.scene_input { REQUESTED } else { EARLY });
+        start(&p, if p.scene_input { REQUESTED } else { EARLY });
+    } else if super::library::warm_enabled()
+        && let Some(shared) = super::library::replayed(&p)
+    {
+        return shared;
     }
+    p
 }
+
+pub(super) fn replay(p: &Arc<Pending>) {
+    p.replayed.store(true, Ordering::Relaxed);
+    start(p, REPLAY);
+}
+
+pub(super) static REPLAY_READY: AtomicU64 = AtomicU64::new(0);
+pub(super) static REPLAY_LATE: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the frame's budget is one for all threads together: a thread
 /// that waits takes what is left of it and gives back what it did not
@@ -396,8 +550,9 @@ fn wait(p: &Pending, frame: u64) {
 
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
-const REQUESTED: u8 = 2;
-const MAKING: u8 = 3;
+const REPLAY: u8 = 2;
+const REQUESTED: u8 = 3;
+const MAKING: u8 = 4;
 
 /// How many workers may make pipelines at once that are known to take long
 /// and that no draw has asked for: a quarter of them. On a fresh cache (a
@@ -427,6 +582,7 @@ struct Queue {
     /// being made ([`slow_limit`]).
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
+    replay: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
 }
 
@@ -437,6 +593,7 @@ impl Queue {
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
+            replay: VecDeque::new(),
             requested: VecDeque::new(),
         }
     }
@@ -457,6 +614,8 @@ impl Queue {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
+        } else if priority == REPLAY {
+            self.replay.push_back(p.clone());
         } else if slow {
             self.slow.push_back(p.clone());
         } else {
@@ -467,14 +626,18 @@ impl Queue {
 
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
         // An early entry can have been promoted and claimed already.
-        let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
-            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+        let unclaimed = |list: &mut VecDeque<Arc<Pending>>, state: u8| {
+            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == state)
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = self
+                .requested
+                .pop_front()
+                .or_else(|| unclaimed(&mut self.replay, REPLAY))
+                .or_else(|| unclaimed(&mut self.early, EARLY));
             if p.is_none() && self.slow_now < slow_limit {
-                p = unclaimed(&mut self.slow);
+                p = unclaimed(&mut self.slow, EARLY);
                 if let Some(p) = &p {
                     p.was_slow.store(true, Ordering::Relaxed);
                     self.slow_now += 1;
@@ -739,5 +902,120 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn requested_work_precedes_ranked_replay_then_creation_order() {
+        let pending = || Arc::new(Pending::new(Vec::new(), None));
+        let (early, hot, cold, live) = (pending(), pending(), pending(), pending());
+        let mut q = Queue::new();
+        q.push(&early, EARLY);
+        q.push(&live, EARLY);
+        q.push(&hot, REPLAY);
+        q.push(&cold, REPLAY);
+        assert_eq!(q.push(&live, REPLAY), Some(false));
+        assert_eq!(q.push(&live, REQUESTED), Some(false));
+        for p in [&live, &hot, &cold, &early] {
+            assert!(Arc::ptr_eq(&q.pop(false, 1).unwrap(), p));
+        }
+        assert!(q.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn pending_graphics_can_bind_the_donor_then_the_real_pipeline() {
+        use victory_shader::{HwStage, emit::HostShader};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
+        use windows::core::s;
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let dxil = crate::host::compile(
+            "float4 main(uint i : SV_VertexID) : SV_Position { return float4(i,0,0,1); }",
+            s!("main"),
+            s!("vs_5_1"),
+        )
+        .unwrap();
+        let shader = Arc::new(Shader {
+            stage: "vertex",
+            hash: "synthetic-standin".into(),
+            container: vec![],
+            ambient: None,
+            translated: OnceLock::from(Some(super::super::Translated {
+                threads: None,
+                used: vec![],
+                tables: crate::draw::TablePlan::new(&[], &[]),
+                stores: false,
+                stores_by_address: false,
+                picks: Default::default(),
+                host: HostShader {
+                    stage: HwStage::Vs,
+                    dxil,
+                    user_data: vec![],
+                    root_cbvs: vec![],
+                    root_srvs: vec![],
+                    root_uavs: vec![],
+                    root_indexed_views: vec![],
+                    samplers: vec![],
+                    static_samplers: vec![],
+                },
+            })),
+        });
+        let make = |stencil_mask| {
+            let mut g = GraphicsState::default();
+            g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            let format = [16u32, DXGI_FORMAT_D32_FLOAT.0 as u32];
+            #[repr(C)]
+            struct Depth(u32, D3D12_DEPTH_STENCIL_DESC);
+            let keep = D3D12_DEPTH_STENCILOP_DESC {
+                StencilFailOp: D3D12_STENCIL_OP_KEEP,
+                StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
+                StencilPassOp: D3D12_STENCIL_OP_KEEP,
+                StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+            };
+            let depth = Depth(
+                11,
+                D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: true.into(),
+                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+                    DepthFunc: D3D12_COMPARISON_FUNC_LESS,
+                    StencilWriteMask: stencil_mask,
+                    FrontFace: keep,
+                    BackFace: keep,
+                    ..Default::default()
+                },
+            );
+            // SAFETY: a complete depth-format subobject.
+            unsafe { g.read(16, format.as_ptr().cast()) };
+            // SAFETY: a complete depth-stencil subobject.
+            unsafe { g.read(11, (&raw const depth).cast()) };
+            Arc::new(Pending::new(vec![shader.clone()], Some(Box::new(g))))
+        };
+        let donor = make(0xff);
+        assert!(now(&donor));
+        let p = make(1);
+        assert!(!p.same_inputs(&donor));
+        let key = p.compatibility().unwrap();
+        assert_eq!(Some(key), donor.compatibility());
+        donors().lock().unwrap().insert(key, Arc::downgrade(&donor));
+        let fallback = p.standin().unwrap() as *const HostPipeline;
+        assert!(std::ptr::eq(
+            fallback,
+            donor.made.get().unwrap().as_ref().unwrap()
+        ));
+        if standins() {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            assert!(std::ptr::eq(fallback, ready(&p).unwrap()));
+            assert!(p.made.get().is_none());
+        }
+        drop(donor);
+        assert!(std::ptr::eq(fallback, p.standin().unwrap()));
+        assert!(now(&p));
+        assert!(!std::ptr::eq(fallback, p.standin().unwrap()));
+        let refused = make(2);
+        assert!(refused.made.set(None).is_ok());
+        assert!(refused.standin().is_none());
+        assert!(Pending::new(vec![shader], None).compatibility().is_none());
     }
 }
