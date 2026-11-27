@@ -5737,6 +5737,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _memo = crate::watch::commit_memo::Epoch::begin();
         // Upscalings these lists recorded, in submission order: the next
         // present tags the latest (frame generation).
         for run in runs {
