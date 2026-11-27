@@ -298,6 +298,7 @@ pub fn run(
         return Ok(());
     }
     victory_loader::report_crashes();
+    victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
@@ -318,6 +319,7 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    victory_hle::known_pipelines::flush();
     println!("title exited with {code}");
     Ok(())
 }

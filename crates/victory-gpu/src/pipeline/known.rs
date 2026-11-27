@@ -122,28 +122,67 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     book.added += 1;
 }
 
-/// Writes what was noted.
-fn flush() {
+/// Appends pipelines noted since the last successful write, if the book is active.
+pub fn flush() {
     let Some(Some(book)) = BOOK.get() else { return };
-    let (dir, new, added) = {
+    flush_book(book);
+}
+
+fn flush_book(book: &Mutex<Book>) {
+    // The timer and shutdown may both flush. Keep their writes in order while
+    // allowing the title to note more pipelines during disk I/O.
+    static WRITER: Mutex<()> = Mutex::new(());
+    let _writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, mut new, added) = {
         let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
         if book.added == 0 {
             return;
         }
         (book.dir.clone(), std::mem::take(&mut book.new), std::mem::take(&mut book.added))
     };
-    for (file, bytes) in [SHADERS, PIPELINES].iter().zip(&new) {
+    for (file, bytes) in [SHADERS, PIPELINES].into_iter().zip(&mut new) {
+        if bytes.is_empty() {
+            continue;
+        }
         let written = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join(file))
-            .and_then(|mut f| f.write_all(bytes));
+            .and_then(|f| append_bytes(f, bytes));
         if let Err(e) = written {
-            tracing::warn!(error = %e, file, "title pipelines not written down");
+            let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+            for (mut older, newer) in new.into_iter().zip(&mut book.new) {
+                if !older.is_empty() {
+                    older.append(newer);
+                    *newer = older;
+                }
+            }
+            book.added += added;
+            drop(book);
+            tracing::warn!(error = %e, file, "keeping unwritten title pipelines for retry");
             return;
         }
     }
     tracing::info!(pipelines = added, "title pipelines written down");
+}
+
+/// A failed append may already have written a prefix of a record.
+fn append_bytes(mut out: impl Write, bytes: &mut Vec<u8>) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let mut written = 0;
+    let result = loop {
+        if written == bytes.len() {
+            break Ok(());
+        }
+        match out.write(&bytes[written..]) {
+            Ok(0) => break Err(Error::from(ErrorKind::WriteZero)),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => break Err(e),
+        }
+    };
+    bytes.drain(..written);
+    result
 }
 
 /// Calls `f` with each container's stage, hash, place and length; where the
@@ -439,6 +478,51 @@ impl GraphicsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_open_retries_before_later_records() {
+        for blocked in [SHADERS, PIPELINES] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            let book = Mutex::new(Book {
+                dir: dir.into(),
+                keys: HashSet::new(),
+                shaders: HashSet::new(),
+                new: [vec![1], vec![11]],
+                added: 1,
+            });
+            std::fs::create_dir(dir.join(blocked)).unwrap();
+            flush_book(&book);
+            std::fs::remove_dir(dir.join(blocked)).unwrap();
+            {
+                let mut b = book.lock().unwrap();
+                assert_eq!(b.added, 1);
+                b.new[0].push(2);
+                b.new[1].push(12);
+                b.added += 1;
+            }
+            flush_book(&book);
+            flush_book(&book);
+            assert_eq!(std::fs::read(dir.join(SHADERS)).unwrap(), [1, 2]);
+            assert_eq!(std::fs::read(dir.join(PIPELINES)).unwrap(), [11, 12]);
+            assert_eq!(book.lock().unwrap().added, 0);
+        }
+    }
+
+    #[test]
+    fn a_short_write_keeps_only_the_unwritten_suffix() {
+        let mut pending = vec![1, 2, 3, 4, 5];
+        let mut first = [0; 2];
+        // A fixed-size output accepts the prefix, then returns Ok(0).
+        let err = append_bytes(&mut first[..], &mut pending).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(first, [1, 2]);
+        assert_eq!(pending, [3, 4, 5]);
+        let mut rest = Vec::new();
+        append_bytes(&mut rest, &mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(rest, [3, 4, 5]);
+    }
 
     #[test]
     fn a_state_comes_back_as_it_was() {
