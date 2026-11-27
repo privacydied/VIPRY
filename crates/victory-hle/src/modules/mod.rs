@@ -22,6 +22,8 @@ pub mod dstorage;
 #[cfg(windows)]
 pub mod fidelityfx;
 #[cfg(windows)]
+pub(crate) mod file_cache;
+#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;

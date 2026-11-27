@@ -270,6 +270,7 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
+    let flags = super::file_cache::host_flags("CreateFileW", access, flags);
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
@@ -290,6 +291,7 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
+    let flags = super::file_cache::host_flags("CreateFileA", access, flags);
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
