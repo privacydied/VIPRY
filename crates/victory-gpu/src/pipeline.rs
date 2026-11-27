@@ -172,12 +172,21 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        // `VICTORY_DUMP_REFUSED=<dir>`: the container as the title gave it,
+                        // `<hash>.cdxil`, for offline work (`victory translate <dir>`).
+                        if let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED") {
+                            let dir = std::path::PathBuf::from(dir);
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(dir.join(format!("{}.cdxil", self.hash)), &self.container[..]);
+                        }
+                    }
                 }
                 done.ok()
             })
