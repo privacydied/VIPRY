@@ -315,6 +315,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         }
     }
     let us = started.elapsed().as_micros() as u64;
+    pacing::long_wait("mapped into the card's address space", us);
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
     MAPPED[1].fetch_add(us, Ordering::Relaxed);
     MAPPED[2].fetch_max(us, Ordering::Relaxed);
@@ -342,6 +343,7 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     // SAFETY: a live heap or resource of the device's.
     let made = unsafe { device.MakeResident(&[Some(object)]) };
     let us = started.elapsed().as_micros() as u64;
+    pacing::long_wait("made resident", us);
     RESIDENT[0].fetch_add(1, Ordering::Relaxed);
     RESIDENT[1].fetch_add(us, Ordering::Relaxed);
     RESIDENT[2].fetch_max(us, Ordering::Relaxed);
@@ -3861,6 +3863,7 @@ pub(crate) mod indirects;
 mod font;
 mod front_plan;
 mod menu;
+mod pacing;
 mod panel;
 mod place;
 pub(crate) mod rec;
@@ -9358,6 +9361,8 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// Present-to-present times for the 5 s line ([`pacing::pace_line`]).
+    pacing: pacing::Pacing,
 }
 
 impl Meter {
@@ -9371,6 +9376,7 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            pacing: pacing::Pacing::new(),
         }
     }
 
@@ -9390,6 +9396,7 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
+        self.pacing.present();
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -9511,6 +9518,7 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            pacing::pace_line(self.pacing.take());
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -10150,7 +10158,7 @@ impl Host {
                 },
             );
             let called = crate::streamline::present_called(&presenting);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let _ = p.swap_chain.Present(pacing::present_sync(), DXGI_PRESENT(0));
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
