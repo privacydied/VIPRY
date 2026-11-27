@@ -87,7 +87,7 @@ before launch (harvestr python 3.9 GB, Firefox ~5 GB).
   but it is on the new base already.
 - Ported from Belobug `e136a555`: `4ccf65a8` (DirectStorage counts the BCPack zlib
   intermediate). `9c49c062` fixes the diagnostics build.
-- Sampler: `~/.hermes/cache/scratch/memsample.py <out.jsonl> [secs]`.
+- Sampler: `linux/memsample.py <out.jsonl> [secs]` (run beside the game).
 
 ## Expectation
 
