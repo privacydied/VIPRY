@@ -239,6 +239,22 @@ pub fn early_depth_counts() -> [u64; 3] {
     EARLY_DEPTH_COUNTS.each_ref().map(|n| n.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Whether the ray-tracing node test answers "nothing hit" for every node
+/// (`VICTORY_RT_MISS=1`; off by default): a box node's four children are
+/// none and a triangle node is a miss, so every traversal ends at its root.
+///
+/// For runs without the structure builder: the title's ray programs then
+/// see nothing (reflection and probe rays reach the sky, local-light shadow
+/// rays hit no occluder) and cost next to nothing on the card; the ray-only
+/// compute programs are left out too (`victory-gpu`'s `skips_rt_skin`).
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn rt_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RT_MISS").is_some_and(|v| v == "1"))
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never

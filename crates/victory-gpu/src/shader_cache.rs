@@ -78,6 +78,7 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_BOUNDS",
             // The cheaper host forms of console float math change the code.
             "VICTORY_LEAN_MATH",
+            "VICTORY_RT_MISS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
