@@ -230,6 +230,11 @@ pub(crate) fn line() {
         free >> 20,
         left >> 20
     );
+    // The driver's share of the PC's memory (on this PC's card it is mapped
+    // through the driver, and those mappings were 4-5 GB that did not swap).
+    if let Some(h) = crate::host::host() {
+        h.log_video_memory("with the memory line");
+    }
     if half_minutes % 2 == 0 && !WALKING.swap(true, Relaxed) {
         let walk = std::thread::Builder::new().name("victory-memory-map".into()).spawn(|| {
             log();
