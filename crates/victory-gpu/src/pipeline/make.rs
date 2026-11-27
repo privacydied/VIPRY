@@ -759,7 +759,11 @@ fn workers() -> bool {
 /// Starts a worker named `name`; whether it started. `screens_only`: it
 /// makes passes over the screen alone.
 pub(super) fn spawn_worker(name: String, screens_only: bool) -> bool {
-    let spawned = std::thread::Builder::new().name(name).spawn(move || {
+    let mut builder = std::thread::Builder::new().name(name);
+    if let Some(bytes) = worker_stack() {
+        builder = builder.stack_size(bytes);
+    }
+    let spawned = builder.spawn(move || {
         // Below the title's own threads (loading, recording),
         // and the streaming one, which is below normal itself
         // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
@@ -795,6 +799,21 @@ pub(super) fn spawn_worker(name: String, screens_only: bool) -> bool {
         tracing::warn!(error = %e, "no pipeline worker");
     }
     spawned.is_ok()
+}
+
+/// `VICTORY_PIPELINE_STACK_MB=<n>`: the workers' stack, reserved only
+/// (unset: Rust's default, which `RUST_MIN_STACK` sets). vkd3d-proton
+/// converts DXIL on the thread that makes the pipeline, recursively over its
+/// control flow; on this PC seven workers die of a stack overflow while they
+/// make one compute pipeline each, with 64 MiB stacks.
+fn worker_stack() -> Option<usize> {
+    static BYTES: OnceLock<Option<usize>> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let mb: usize = std::env::var("VICTORY_PIPELINE_STACK_MB").ok()?.trim().parse().ok()?;
+        let bytes = mb.checked_mul(1 << 20).filter(|&b| b > 0)?;
+        tracing::info!(mb, "pipeline worker stack (VICTORY_PIPELINE_STACK_MB)");
+        Some(bytes)
+    })
 }
 
 /// A pipeline from the slow list is no longer being made ([`slow_limit`]).
