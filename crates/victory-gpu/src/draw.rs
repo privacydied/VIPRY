@@ -3263,7 +3263,19 @@ impl State {
                 _ => rest(0, || host.texture_slot_checked(index)),
             };
             if let Some((at, len, print, looks, uploaded)) = checked {
-                let looked = timed(0, || crate::texture::fingerprint(at, len));
+                // `VICTORY_HEAP_WORKER=1`: read on our thread; the slot
+                // stays due until a later pass has the answer.
+                let last = RECHECK_FRAMES.get(usize::from(looks) + 1).is_none();
+                let look = if crate::heap_worker::on() && !baking {
+                    crate::heap_worker::look(at, len, uploaded, frame, last)
+                } else {
+                    crate::heap_worker::Look::Here
+                };
+                let looked = match look {
+                    crate::heap_worker::Look::Print(seen) => seen,
+                    crate::heap_worker::Look::Later => continue,
+                    crate::heap_worker::Look::Here => timed(0, || crate::texture::fingerprint(at, len)),
+                };
                 if looked == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     outcome(slot_outcome::UNCHANGED);
