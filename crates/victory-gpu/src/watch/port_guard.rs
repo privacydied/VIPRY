@@ -358,3 +358,25 @@ pub(super) fn forget_views(first: usize, last: usize) {
 pub(super) fn shared_looks() -> bool {
     port_guard() && TO_SETTLE.load(std::sync::atomic::Ordering::SeqCst) == 0
 }
+
+/// With renderer port #6: whether a submission's look at which refreshes
+/// copy nothing (`Shadow::nothing_new`, before the threads are woken for the
+/// others) is made on the threads beside the submitting one, as it already
+/// was for more than 256 refreshes (`VICTORY_PORT_GUARD_PLAN=0`: on the
+/// submitting thread, as before; A/B-able by that name).
+///
+/// A look walks the journal's every page ever written in the range; one
+/// submission a frame spent up to 6 ms in it alone, the six threads beside it
+/// idle.
+pub(crate) fn port_guard_plan() -> bool {
+    if !port_guard() {
+        return false;
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_PORT_GUARD_PLAN") {
+        return on;
+    }
+    // Read here: renderer port #6's planning beside the submitting thread.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_GUARD_PLAN").is_none_or(|v| v != "0"))
+}

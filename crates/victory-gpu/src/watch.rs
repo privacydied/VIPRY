@@ -33,7 +33,7 @@ use std::sync::{Condvar, Mutex, RwLock};
 mod ask_noreset;
 // Renderer port #6 (`VICTORY_PORT_GUARD`).
 mod port_guard;
-pub(crate) use port_guard::{port_guard, port_guard_line};
+pub(crate) use port_guard::{port_guard, port_guard_line, port_guard_plan};
 use port_guard::{
     Claims, P6_NOT_ASKED, VIEWS, forget_views, guard_shared, known_views, open_faulted, port6_count, refused_as_view, shared_looks,
 };
