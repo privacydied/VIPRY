@@ -74,6 +74,10 @@ pub(super) trait Work: Send {
     }
     /// Waits until a folded one is free to go.
     fn settle(_: &Self::Ask) {}
+    /// What it is, for what the line stands at ([`super::stand`]).
+    fn stand_kind(&self) -> usize {
+        super::stand::OTHER
+    }
     /// Takes `next`, what its queue was given behind it, along to be done with
     /// it; or gives it back. Whether it is a submission that was taken.
     fn take_along(&mut self, next: Self) -> Result<bool, Self>
@@ -269,14 +273,17 @@ impl<W: Work> Lane<W> {
             let (asked, limit) = {
                 let mut state = self.lock();
                 while state.asked == state.served {
+                    let stood = super::stand::begin(state.items.front().map(|e| e.what.stand_kind()));
                     if state.items.is_empty() {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
+                        super::stand::end(stood);
                     } else {
                         // It stands at something the CPU may write without
                         // a call of ours.
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
+                        super::stand::end(stood);
                         if out.timed_out() {
                             break;
                         }
@@ -284,7 +291,9 @@ impl<W: Work> Lane<W> {
                 }
                 (state.asked, state.next)
             };
+            let looked = super::stand::looking();
             self.look(limit);
+            super::stand::end(looked);
             let mut state = self.lock();
             state.served = state.served.max(asked);
             drop(state);
@@ -551,6 +560,17 @@ impl Work for Job {
 
     fn shows(&self) -> bool {
         matches!(self, Job::Present(..))
+    }
+
+    fn stand_kind(&self) -> usize {
+        use super::stand::{FENCE, LISTS, OTHER, PRESENT, VALUE};
+        match self {
+            Job::Wait(..) => FENCE,
+            Job::Value(..) => VALUE,
+            Job::Lists(..) => LISTS,
+            Job::Present(..) => PRESENT,
+            _ => OTHER,
+        }
     }
 
     fn runs(&self) -> bool {
@@ -976,6 +996,7 @@ pub(super) fn line(frames: f64) {
         s[FORCED] / frames,
         s[JOINED] / frames
     );
+    super::stand::line(frames);
 }
 
 #[cfg(test)]
