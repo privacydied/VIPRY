@@ -4511,7 +4511,7 @@ impl Host {
             let indirects = indirects::Shared::default();
             #[cfg(feature = "diagnostics")]
             if dred_on() || dred_light() {
-                static NUMBER: AtomicU32 = AtomicU32::new(0);
+                static NUMBER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 let number = NUMBER.fetch_add(1, Ordering::Relaxed);
                 name(&list, || format!("victory host list {number}"));
                 let mut all = LIST_NOTES.lock().unwrap_or_else(|e| e.into_inner());
