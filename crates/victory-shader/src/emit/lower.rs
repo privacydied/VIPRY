@@ -1143,7 +1143,8 @@ pub(super) fn lds_order(p: &crate::ir::Program, st: &Structured) -> LdsOrder {
 /// there: before the exit of an all-lane block into a region with LDS accesses, and at the
 /// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
+/// joined without an all-lane block between them): refused, unless it only raises a flag
+/// ([`super::lds_flags`]).
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
 fn lds_meetings(
     p: &crate::ir::Program,
@@ -1199,8 +1200,12 @@ fn lds_meetings(
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
-        return None;
+    // A region that reads and writes LDS is still taken when it only raises flags.
+    for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
+        let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+        if !(super::lds_flags::enabled() && super::lds_flags::lds_flag_region(p, st, &blocks)) {
+            return None;
+        }
     }
     let mut meet = vec![(false, false); n];
     for b in 0..n {
