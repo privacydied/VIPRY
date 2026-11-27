@@ -23,10 +23,13 @@ pub(super) const PRESENT: usize = 4;
 pub(super) const OTHER: usize = 5;
 /// The serving thread looking at the line and doing what is free to run.
 const LOOKING: usize = 6;
+/// The oldest entry waits for a memory value while lists further on in the
+/// line are still being translated (the write it waits for may be in them).
+pub(super) const VALUE_BEHIND_LISTS: usize = 7;
 
 /// Nanoseconds per kind since the last line, and the waits of each kind.
-static NS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
-static WAITS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static WAITS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Whether the line's waits are timed.
 pub(super) fn on() -> bool {
@@ -34,10 +37,11 @@ pub(super) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LINE_STANDS").is_some_and(|v| v == "1"))
 }
 
-/// A wait of the serving thread begins, the oldest entry being of `kind`
-/// (`None`: the line is empty). `None` back when the switch is off.
-pub(super) fn begin(kind: Option<usize>) -> Option<(usize, Instant)> {
-    on().then(|| (kind.unwrap_or(EMPTY), Instant::now()))
+/// A wait of the serving thread begins, the oldest entry being of the kind
+/// `kind` says (`None`: the line is empty). `None` back when the switch is
+/// off.
+pub(super) fn begin(kind: impl FnOnce() -> Option<usize>) -> Option<(usize, Instant)> {
+    on().then(|| (kind().unwrap_or(EMPTY), Instant::now()))
 }
 
 /// The serving thread looks at the line and does what is free.
@@ -63,8 +67,9 @@ pub(super) fn line(frames: f64) {
     tracing::info!(
         "the line's serving thread per frame (VICTORY_LINE_STANDS=1): {:.1} ms looking at it and doing what was free \
          ({:.0} times); waiting {:.1} ms with the line empty, and with its oldest entry standing {:.1} ms at a fence \
-         wait ({:.0} waits), {:.1} ms at a memory value ({:.0}), {:.1} ms at lists still being translated ({:.0}), \
-         {:.1} ms at a present ({:.0}), {:.1} ms at other work ({:.0})",
+         wait ({:.0} waits), {:.1} ms at a memory value with no lists being translated in the line ({:.0}) and \
+         {:.1} ms with some ({:.0}), {:.1} ms at lists still being translated ({:.0}), {:.1} ms at a present ({:.0}), \
+         {:.1} ms at other work ({:.0})",
         ms[LOOKING],
         n[LOOKING],
         ms[EMPTY],
@@ -72,6 +77,8 @@ pub(super) fn line(frames: f64) {
         n[FENCE],
         ms[VALUE],
         n[VALUE],
+        ms[VALUE_BEHIND_LISTS],
+        n[VALUE_BEHIND_LISTS],
         ms[LISTS],
         n[LISTS],
         ms[PRESENT],

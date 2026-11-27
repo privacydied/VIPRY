@@ -273,7 +273,11 @@ impl<W: Work> Lane<W> {
             let (asked, limit) = {
                 let mut state = self.lock();
                 while state.asked == state.served {
-                    let stood = super::stand::begin(state.items.front().map(|e| e.what.stand_kind()));
+                    let stood = super::stand::begin(|| {
+                        let kind = state.items.front()?.what.stand_kind();
+                        let translating = state.items.iter().any(|e| e.what.folded());
+                        Some(if kind == super::stand::VALUE && translating { super::stand::VALUE_BEHIND_LISTS } else { kind })
+                    });
                     if state.items.is_empty() {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
                         super::stand::end(stood);
