@@ -1,5 +1,5 @@
 //! Refreshes done before a title write only where the write lands
-//! (`VICTORY_FLUSH_NARROW=1`, off by default).
+//! (`VICTORY_FLUSH_NARROW=0` turns it off; on by default).
 //!
 //! A refresh step (`Step::Refresh`) waits in the submission's [`Batch`]
 //! until something needs the copy up to date. Before each step that writes
@@ -24,10 +24,14 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use super::Batch;
 
-/// Whether it is on.
+/// Whether it is on (`=0` turns it off).
 pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FLUSH_NARROW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| parse(std::env::var("VICTORY_FLUSH_NARROW").ok().as_deref()))
+}
+
+fn parse(val: Option<&str>) -> bool {
+    !matches!(val, Some("0"))
 }
 
 /// Since the last frame line: title writes seen, of them those that had
@@ -98,7 +102,7 @@ pub(super) fn line(frames: f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::overlaps;
+    use super::{overlaps, parse};
 
     #[test]
     fn overlap_is_a_shared_byte() {
@@ -106,5 +110,12 @@ mod tests {
         assert!(!overlaps(0, 10, 10, 20));
         assert!(!overlaps(20, 30, 10, 20));
         assert!(overlaps(5, 6, 0, 100));
+    }
+
+    #[test]
+    fn default_on_and_explicit_off() {
+        assert!(parse(None));
+        assert!(parse(Some("1")));
+        assert!(!parse(Some("0")));
     }
 }
