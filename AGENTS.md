@@ -24,6 +24,18 @@ Target: RTX 3090, Ryzen 7 3700X, 31 GB RAM, Steam with Proton Experimental.
 - Write commits in English. No AI attribution lines in commits. A pull request
   body ends with `AI-assisted`.
 
+## No god files
+
+- Do not write monolithic "god files". One file does one job.
+- New code that does its own job goes in a new module, not at the end of a large file.
+- Do not make the large files larger. The largest today: `crates/victory-shader/src/emit/lower.rs`
+  (about 14,000 lines), `crates/victory-gpu/src/host.rs` (about 11,500),
+  `crates/victory-gpu/src/descriptor/host.rs`, `draw.rs`, `shadow.rs` and `watch.rs`
+  (5,000-7,000 each). When you change one of them, put the new logic in a module of its own and
+  call it from there.
+- Moving existing code out of a large file is its own commit, with no change in behavior.
+  Do not mix it with a fix or a feature.
+
 ## Commit and push
 
 - Commit and push after every meaningful change. Do not let work pile up uncommitted.
