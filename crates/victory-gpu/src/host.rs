@@ -3882,6 +3882,7 @@ pub(crate) mod copy_split;
 mod relay_lag;
 pub(crate) mod indirects;
 mod font;
+mod flush_narrow;
 mod front_plan;
 mod menu;
 mod pacing;
@@ -7865,7 +7866,11 @@ impl HostList {
                         copies += 1;
                     }
                     batch.fill();
-                    batch.title_written();
+                    if flush_narrow::on() {
+                        batch.title_written_at(dst, len);
+                    } else {
+                        batch.title_written();
+                    }
                     // Into a heap's records: the rounds asked for earlier
                     // did not see it (`crate::heap_marks`).
                     if crate::heap_marks::on() && crate::descriptor::in_shader_heap(dst, len) {
@@ -7904,7 +7909,9 @@ impl HostList {
                     }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
-                    if free {
+                    if free && flush_narrow::on() {
+                        batch.title_written_at(p.dst, p.len);
+                    } else if free {
                         batch.title_written();
                     }
                     if let Some(bytes) = p.prepare(free) {
@@ -9503,6 +9510,7 @@ impl Meter {
         spans::line(frames);
         crate::shadow::back_line(frames);
         submit_split_line(frames);
+        flush_narrow::line(frames);
         fresh_open_line(frames);
         crate::heap_marks::line(frames);
         #[cfg(feature = "diagnostics")]
