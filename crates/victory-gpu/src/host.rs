@@ -2029,24 +2029,30 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
-/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
-fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
+/// A scratch chunk of `size` bytes or more: one kept ([`SPARE`]) or a new
+/// one; and its size (a small first one may be a kept regular one,
+/// [`scratch_any`]).
+fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
     if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
+        && let Some((chunk, size)) =
+            scratch_any::take(&mut SPARE.lock().unwrap_or_else(|e| e.into_inner()), size, SCRATCH_FIRST, SCRATCH_CHUNK)
     {
         ALIVE[3].fetch_sub(1, Ordering::Relaxed);
         ALIVE[4].fetch_sub(size, Ordering::Relaxed);
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
-        return Some(chunk);
+        return Some((chunk, size));
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
-    Some(Chunk {
-        buffer,
-        data: data as usize,
-    })
+    Some((
+        Chunk {
+            buffer,
+            data: data as usize,
+        },
+        size,
+    ))
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
@@ -3875,6 +3881,7 @@ mod pacing;
 mod panel;
 mod place;
 pub(crate) mod rec;
+mod scratch_any;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
@@ -7459,7 +7466,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let (chunk, size) = take_chunk(host, size)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }
@@ -7806,7 +7813,7 @@ impl HostList {
         read: (usize, usize),
         fill: impl Fn(usize) + Send + 'static,
     ) -> Option<ID3D12Resource> {
-        let chunk = take_chunk(host()?, size)?;
+        let (chunk, size) = take_chunk(host()?, size)?;
         let source = chunk.buffer.clone();
         let destination = chunk.data;
         let mut deferred = self.deferred();
