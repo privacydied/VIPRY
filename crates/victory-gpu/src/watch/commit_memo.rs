@@ -1,23 +1,33 @@
-//! What the kernel said about uncommitted blocks, kept for one
-//! submission's preparing (`VICTORY_COMMIT_MEMO=1`).
+//! Runs of uncommitted blocks the kernel named, kept for the title's frame
+//! (`VICTORY_COMMIT_MEMO=1`, off by default).
 //!
-//! A refresh of a host copy asks the kernel, for each block the guards hold
-//! as absent, whether it is still uncommitted ([`super::uncommitted_end`]).
-//! A submission refreshes the same buffers in many flushes, so the same
-//! blocks are asked again and again; under Wine each question takes the
-//! process's virtual-memory lock, which the submitting thread and the wide
-//! threads then take in turns (a profile had 13.7 % of their preparing in
-//! it, the bytes copied 3 %).
+//! A refresh of a host copy asks the kernel about each block the guards hold
+//! as absent that is not a known placeholder hole: is it still uncommitted
+//! ([`super::uncommitted_end`], VirtualQuery)? Such a range is never known
+//! clean as a whole, so every refresh of it walks its holes again, in each
+//! of a frame's ~42 flushes. Under Wine each question takes the process's
+//! virtual-memory lock, and the submitting thread and the wide threads take
+//! it in turns. In a profile (L4-c361180c, WAIT_EACH on) the questions were
+//! 22 % of the submitting thread's preparing and 13 % of the wide threads'.
 //!
-//! With the switch the answers are kept while a submission is prepared
-//! ([`Epoch`]) and forgotten when it ends and whenever the title's memory
-//! changes in a way we are told of (`title_memory_*`, [`super::materialize`]).
-//! What a submission reads was committed before the title submitted it, so
-//! before its preparing began: an answer got after that is good for it. An
-//! answer asked while a change was told is not kept ([`GENERATION`]).
+//! With the switch a run of uncommitted blocks the kernel named answers for
+//! every block in it until the title's next frame begins
+//! ([`crate::frame::current`]), or until the runtime tells of a change to
+//! memory the run touches (`title_memory_*`, a lazy view made real): then
+//! only the touched runs are let go of. A question asked across a told
+//! change is not kept. Committed answers are not kept: the walk takes such a
+//! block out of its absent blocks, so it is not asked about again.
+//!
+//! What is given up: a commit of such memory that nobody tells us of (the
+//! title's own VirtualAlloc reaches Windows directly) is seen at the first
+//! walk of the next frame, not at the next walk. The same rule in Xeltax's
+//! fork (`VICTORY_GUARD_ABSENT_KNOWN=1`, a7f24db9) re-asked one answer in
+//! 64 and found 0 of 372,487 wrong. Before the frame rule this module kept
+//! answers for one submission and forgot all of them at any change: that
+//! kept 27,000 answers a second but still asked 65,000 (run L2-memo-B-fsync).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Whether the switch is on.
@@ -26,65 +36,54 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_COMMIT_MEMO"))
 }
 
-/// Whether a submission is being prepared now (answers are kept).
-static ACTIVE: AtomicBool = AtomicBool::new(false);
-/// Moved by every forgetting: an answer asked across one is not kept.
-static GENERATION: AtomicU64 = AtomicU64::new(0);
-/// Answers by the block asked about: the end (exclusive) of the uncommitted
-/// blocks from it, or the block itself where it is committed.
-static ANSWERS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
-/// Questions answered from [`ANSWERS`], and asked of the kernel, while a
-/// submission was prepared (for the line).
+struct Runs {
+    /// The frame the runs were named in.
+    frame: u64,
+    /// Moved by every told change: a question asked across one is not kept.
+    generation: u64,
+    /// First block of a run of uncommitted blocks to the end of the run
+    /// (exclusive). The runs do not overlap.
+    runs: BTreeMap<usize, usize>,
+}
+
+static RUNS: Mutex<Runs> = Mutex::new(Runs {
+    frame: u64::MAX,
+    generation: 0,
+    runs: BTreeMap::new(),
+});
+/// Questions answered from a run, and asked of the kernel (for the line).
 static KEPT: AtomicU64 = AtomicU64::new(0);
 static ASKED: AtomicU64 = AtomicU64::new(0);
 
-fn forget() {
-    GENERATION.fetch_add(1, Ordering::AcqRel);
-    ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+fn runs() -> std::sync::MutexGuard<'static, Runs> {
+    RUNS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// One submission's preparing: answers are kept until it is dropped.
-pub(crate) struct Epoch(bool);
-
-impl Epoch {
-    pub(crate) fn begin() -> Epoch {
-        if !on() {
-            return Epoch(false);
-        }
-        forget();
-        ACTIVE.store(true, Ordering::Release);
-        Epoch(true)
+/// The runtime told of a change to title memory at `[at, at + len)`: the
+/// runs touching its blocks are let go of.
+pub(crate) fn changed(at: usize, len: usize) {
+    if !on() {
+        return;
     }
+    let (first, last) = (
+        at / super::BLOCK,
+        at.saturating_add(len.max(1)).div_ceil(super::BLOCK),
+    );
+    forget(&mut runs(), first, last);
 }
 
-impl Drop for Epoch {
-    fn drop(&mut self) {
-        if self.0 {
-            ACTIVE.store(false, Ordering::Release);
-            forget();
-            line();
-        }
+/// The runs touching blocks `[first, last)` are let go of.
+fn forget(r: &mut Runs, first: usize, last: usize) {
+    r.generation += 1;
+    let mut gone: Vec<usize> = r.runs.range(first..last).map(|(&from, _)| from).collect();
+    if let Some((&from, &end)) = r.runs.range(..first).next_back()
+        && end > first
+    {
+        gone.push(from);
     }
-}
-
-/// The title's memory changed (committed, freed, mapped, unmapped, made
-/// real): what was kept may be wrong now.
-pub(crate) fn changed() {
-    if on() && ACTIVE.load(Ordering::Acquire) {
-        forget();
+    for from in gone {
+        r.runs.remove(&from);
     }
-}
-
-/// The answer kept for `block`, if any.
-fn kept(block: usize) -> Option<usize> {
-    let answers = ANSWERS.lock().unwrap_or_else(|e| e.into_inner());
-    let (&from, &end) = answers.range(..=block).next_back()?;
-    if from == block && end == block {
-        // Committed.
-        return Some(block);
-    }
-    // Uncommitted from `from` to `end`: so is every block between.
-    (from <= block && block < end).then_some(end)
 }
 
 /// [`super::uncommitted_end`] of `block`, `ask` being the kernel's answer.
@@ -92,50 +91,73 @@ pub(super) fn uncommitted_end(block: usize, ask: impl FnOnce(usize) -> usize) ->
     if !on() {
         return ask(block);
     }
-    memo(block, ask)
+    line();
+    memo(block, crate::frame::current(), ask)
 }
 
-/// [`uncommitted_end`] with the switch on.
-fn memo(block: usize, ask: impl FnOnce(usize) -> usize) -> usize {
-    if !ACTIVE.load(Ordering::Acquire) {
-        return ask(block);
-    }
-    if let Some(end) = kept(block) {
-        KEPT.fetch_add(1, Ordering::Relaxed);
-        return end;
-    }
-    let generation = GENERATION.load(Ordering::Acquire);
+/// [`uncommitted_end`] with the switch on, in frame `frame`.
+fn memo(block: usize, frame: u64, ask: impl FnOnce(usize) -> usize) -> usize {
+    let generation = {
+        let mut r = runs();
+        if r.frame != frame {
+            r.frame = frame;
+            r.runs.clear();
+        }
+        if let Some((_, &end)) = r.runs.range(..=block).next_back()
+            && block < end
+        {
+            KEPT.fetch_add(1, Ordering::Relaxed);
+            return end;
+        }
+        r.generation
+    };
+    // (Asked with the lock not held: the kernel's answer takes its own.)
     let end = ask(block);
     ASKED.fetch_add(1, Ordering::Relaxed);
-    let mut answers = ANSWERS.lock().unwrap_or_else(|e| e.into_inner());
-    // (Not across a forgetting, nor after the submission ended.)
-    if GENERATION.load(Ordering::Acquire) == generation && ACTIVE.load(Ordering::Acquire) {
-        answers.insert(block, end.max(block));
+    if end > block {
+        let mut r = runs();
+        if r.generation == generation && r.frame == frame {
+            // The runs inside this one were named before it grew.
+            let inside: Vec<usize> = r
+                .runs
+                .range(block + 1..end)
+                .map(|(&from, _)| from)
+                .collect();
+            for from in inside {
+                r.runs.remove(&from);
+            }
+            r.runs.insert(block, end);
+        }
     }
     end
 }
 
-/// Each few seconds, what the memo saved.
+/// Each ten seconds, what the runs saved (target `victory_gpu::host`).
 fn line() {
-    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    let now = std::time::Instant::now();
-    let Some(was) = *last else {
-        *last = Some(now);
-        return;
-    };
-    let seconds = now.duration_since(was).as_secs_f64();
-    if seconds < 10.0 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static SINCE: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+    let now = crate::frame::current();
+    if now < NEXT.load(Ordering::Relaxed) {
         return;
     }
-    *last = Some(now);
-    let kept = KEPT.swap(0, Ordering::Relaxed);
-    let asked = ASKED.swap(0, Ordering::Relaxed);
+    // (Looked at once in 16 frames at most.)
+    NEXT.store(now + 16, Ordering::Relaxed);
+    let mut since = SINCE.lock().unwrap_or_else(|e| e.into_inner());
+    let at = std::time::Instant::now();
+    let Some((was, frame_was)) = *since else {
+        *since = Some((at, now));
+        return;
+    };
+    if at.duration_since(was).as_secs_f64() < 10.0 || now <= frame_was {
+        return;
+    }
+    *since = Some((at, now));
+    let frames = (now - frame_was) as f64;
     tracing::info!(
         target: "victory_gpu::host",
-        "uncommitted blocks while preparing (VICTORY_COMMIT_MEMO): {:.0} questions a second answered from what the kernel said earlier in the submission, {:.0} asked of it",
-        kept as f64 / seconds,
-        asked as f64 / seconds
+        "uncommitted blocks per frame (VICTORY_COMMIT_MEMO): {:.0} questions answered from a run the kernel named earlier in the frame, {:.0} asked of it",
+        KEPT.swap(0, Ordering::Relaxed) as f64 / frames,
+        ASKED.swap(0, Ordering::Relaxed) as f64 / frames
     );
 }
 
@@ -143,34 +165,62 @@ fn line() {
 mod tests {
     use super::*;
 
-    // (One test: the memo is global.)
+    // (One test: the runs are global.)
     #[test]
-    fn keeps_answers_for_one_submission_only() {
-        // The kernel's answers: uncommitted from block 10 to 20.
+    fn runs_answer_for_the_frame_until_a_change_touches_them() {
+        // The kernel's answers: uncommitted from block 10 to 20 and from 30
+        // to 40, committed elsewhere.
         let asked = std::cell::Cell::new(0);
         let ask = |b: usize| {
             asked.set(asked.get() + 1);
-            if (10..20).contains(&b) { 20 } else { b }
+            match b {
+                10..20 => 20,
+                30..40 => 40,
+                _ => b,
+            }
         };
-        // Outside a submission nothing is kept.
-        assert_eq!(memo(10, ask), 20);
-        assert_eq!(memo(10, ask), 20);
-        assert_eq!(asked.get(), 2);
-        ACTIVE.store(true, Ordering::Release);
-        forget();
-        asked.set(0);
-        assert_eq!(memo(10, ask), 20);
-        assert_eq!(memo(15, ask), 20);
-        assert_eq!(memo(19, ask), 20);
-        assert_eq!(memo(5, ask), 5);
-        assert_eq!(memo(5, ask), 5);
-        assert_eq!(memo(20, ask), 20);
-        assert_eq!(asked.get(), 3);
-        // The title's memory changed: asked again.
-        forget();
-        assert_eq!(memo(15, ask), 20);
+        assert_eq!(memo(10, 1, ask), 20);
+        assert_eq!(memo(15, 1, ask), 20);
+        assert_eq!(memo(19, 1, ask), 20);
+        assert_eq!(asked.get(), 1);
+        // Committed answers are asked again.
+        assert_eq!(memo(5, 1, ask), 5);
+        assert_eq!(memo(5, 1, ask), 5);
+        assert_eq!(memo(20, 1, ask), 20);
         assert_eq!(asked.get(), 4);
-        ACTIVE.store(false, Ordering::Release);
-        forget();
+        assert_eq!(memo(35, 1, ask), 40);
+        assert_eq!(asked.get(), 5);
+        // A change touching the second run: only it is asked again.
+        forget(&mut runs(), 39, 40);
+        assert_eq!(memo(12, 1, ask), 20);
+        assert_eq!(asked.get(), 5);
+        assert_eq!(memo(31, 1, ask), 40);
+        assert_eq!(asked.get(), 6);
+        // A change just past a run's end leaves it.
+        forget(&mut runs(), 20, 25);
+        assert_eq!(memo(19, 1, ask), 20);
+        assert_eq!(asked.get(), 6);
+        // The next frame asks again.
+        assert_eq!(memo(15, 2, ask), 20);
+        assert_eq!(asked.get(), 7);
+        // A run named from its middle, then from before it: one run.
+        forget(&mut runs(), 0, 100);
+        assert_eq!(memo(15, 2, ask), 20);
+        assert_eq!(memo(12, 2, ask), 20);
+        assert_eq!(
+            runs()
+                .runs
+                .iter()
+                .map(|(&a, &b)| (a, b))
+                .collect::<Vec<_>>(),
+            vec![(12, 20)]
+        );
+        // A change told while a question was out: its answer is not kept.
+        let ask_changing = |b: usize| {
+            forget(&mut runs(), 0, 1);
+            ask(b)
+        };
+        assert_eq!(memo(30, 2, ask_changing), 40);
+        assert!(runs().runs.range(30..31).next().is_none());
     }
 }

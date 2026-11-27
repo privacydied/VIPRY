@@ -1665,7 +1665,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
-    commit_memo::changed();
+    commit_memo::changed(at, len);
     if len == 0 || !known_holes() {
         return;
     }
@@ -2925,7 +2925,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// ([`views_mapped`]). What is guarded of its pages at other views is opened,
 /// and not guarded again before the change is done ([`Remapping`]).
 pub fn title_memory_splitting(at: usize, len: usize) {
-    commit_memo::changed();
+    commit_memo::changed(at, len);
     let others: Vec<usize> = elsewhere(at, len).into_iter().flat_map(|(_, others)| others).collect();
     if others.is_empty() {
         return;
@@ -3160,7 +3160,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
-    commit_memo::changed();
+    commit_memo::changed(at, len);
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
@@ -3171,7 +3171,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
-    commit_memo::changed();
+    commit_memo::changed(at, len);
     crate::texback::remapped(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = title_memory_changed(at, len);
@@ -3197,7 +3197,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
-    commit_memo::changed();
+    commit_memo::changed(at, len);
     crate::shadow::write_combined_freed(at, len);
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
@@ -3317,7 +3317,7 @@ pub(crate) fn materialize(at: usize, len: usize) -> bool {
         None => LAZY_VIEWS.get().is_some_and(|f| f(at, len.max(1))),
     };
     if made {
-        commit_memo::changed();
+        commit_memo::changed(at, len);
     }
     made
 }
@@ -3395,7 +3395,7 @@ pub fn soft_view_guards() -> [u64; 2] {
 /// the view is there (as [`title_memory_remapped`] is), with the runtime's
 /// lock on its views held.
 pub fn title_memory_made_real(at: usize, len: usize) {
-    commit_memo::changed();
+    commit_memo::changed(at, len);
     if len == 0 {
         return;
     }
