@@ -4663,6 +4663,11 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // Renderer port 5: title memory in place is the
+                        // card's to read where it is; nothing is copied.
+                        if crate::port_cbv::in_place_at(host, index, address, size) {
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;

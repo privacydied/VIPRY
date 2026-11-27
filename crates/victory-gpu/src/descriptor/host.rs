@@ -23,6 +23,9 @@ fn raw_view_clamp() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEW_CLAMP").is_none_or(|v| v != "0"))
 }
 
+/// Renderer port 5: the host's views of constant buffers read as raw bytes.
+mod cbv;
+
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
 /// 5 ms of a frame, timeline thin-6).
@@ -4898,6 +4901,12 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
+            if crate::port_cbv::on() {
+                // Renderer port 5: shaders read constant buffers as raw bytes
+                // through the twin; a constant buffer view there would be read
+                // raw, with no end on AMD.
+                return cbv::constant_twinned(&shadow.buffer, gpu, size, at, twin).then(|| Some(shadow.buffer.clone()));
+            }
             if gpu % 256 != 0 {
                 once!(
                     address = format_args!("{address:#x}"),

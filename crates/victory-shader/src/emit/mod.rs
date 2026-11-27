@@ -83,6 +83,8 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod cbv_tests;
+#[cfg(all(test, windows))]
 mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
@@ -125,7 +127,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     LAUNCH_SPACE, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, MESH_PAYLOAD_BYTES, ROOT_CBV_SPACE, mesh_launch, mesh_payload_bytes, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
