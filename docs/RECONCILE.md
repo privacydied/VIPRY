@@ -63,6 +63,32 @@ Frame generation needs RTX 40+: not for the 3090.
 Skip: AMD-only work (Belobug RDNA4, avatarmanz 7900 XTX tuning), DexNom ray tracing (1 fps),
 klbf-lab (mostly bench/README), VItoriaBr (ports of trustno1/fxceless already above).
 
+## RAM findings on the old base (diag build, 11-27; redo on `vipry-next`)
+
+Two runs of `--profile diag --features diagnostics`, `/proc/<pid>/smaps` every 15 s,
+~7 min into the world. PC: 31 GiB RAM, 16-20 GB swap already used by other programs
+before launch (harvestr python 3.9 GB, Firefox ~5 GB).
+
+| | Baseline | `VICTORY_WINDOW_KB=1024` + `VICTORY_WINDOW_TAILS=1` |
+|---|---|---|
+| Game RSS+swap | 10.4-11.6 GB | 9.9-11.2 GB |
+| Title-memory windows outside buffers | 3.7 GB (~800) | 2.4-3.1 GB (~1600-2000) |
+| Host textures | 4.5 GB | 4.2 GB |
+| fps | 0.3-1.4 | 0.2-1.7 |
+
+- PC free RAM stayed under ~2.4 GB: the game swaps; that, not the GPU, sets fps here.
+- The window switches save 0.6-1.3 GB of copies but no clear total or fps change
+  (run B had ~3 GB more swap from other programs, so it is noisy). Re-measure before
+  putting them in `VIPRY.env`.
+- Belobug `ffc2cf6f` (window budget under RAM bands): no effect on this PC. Free RAM
+  < 2 GB already gives a 2 s idle sweep, and with that sweep the budget can only free
+  fewer idle copies, not more. Not ported.
+- trustno1 `residency.rs` limits texture staging (50-170 MB live here): small gain,
+  but it is on the new base already.
+- Ported from Belobug `e136a555`: `4ccf65a8` (DirectStorage counts the BCPack zlib
+  intermediate). `9c49c062` fixes the diagnostics build.
+- Sampler: `~/.hermes/cache/scratch/memsample.py <out.jsonl> [secs]`.
+
 ## Expectation
 
 foxhound's own table puts a 3080 + Ryzen 7 5700X at about 15 fps on Windows. A 3700X is slower,
