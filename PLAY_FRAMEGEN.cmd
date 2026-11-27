@@ -1,8 +1,8 @@
 @echo off
 rem One-click start of the title on VIctory-NVIDIA (DLSS + frame generation). ASCII only.
-rem   PLAY_FRAMEGEN.bat          menu
-rem   PLAY_FRAMEGEN.bat 1..6     start that mode directly
-rem   PLAY_FRAMEGEN.bat check    only show paths and what is ready
+rem   PLAY_FRAMEGEN.cmd          menu
+rem   PLAY_FRAMEGEN.cmd 1..6     start that mode directly
+rem   PLAY_FRAMEGEN.cmd check    only show paths and what is ready
 setlocal
 set "PS1=%~dp0scripts\play-framegen.ps1"
 set "PSH=powershell"
@@ -13,7 +13,7 @@ if not exist "%PS1%" (
   exit /b 1
 )
 if /i "%~1"=="check" (
-  %PSH% -NoProfile -File "%PS1%" -Check
+  %PSH% -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Check
   pause
   exit /b 0
 )
@@ -38,7 +38,7 @@ if errorlevel 6 (set "PICK=6") else if errorlevel 5 (set "PICK=5") else if error
 
 :run
 echo.
-%PSH% -NoProfile -File "%PS1%" -Mode %PICK%
+%PSH% -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode %PICK%
 
 :end
 echo.
