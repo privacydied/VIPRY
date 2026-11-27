@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod clean_cache;
 mod exact_fast;
 // The title's bytes under flights' writes, compared and put in in one pass.
 mod small_bar;
@@ -59,6 +60,12 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// How often a range was added to `pending`: tells a cached answer in
+    /// [`clean_cache`] that shaders may be writing a range now.
+    pending_epoch: AtomicU64,
+    /// Cached "nothing to copy" answers, kept while the title's blocks stay
+    /// read-only (`VICTORY_CLEAN_REFRESH`, off by default).
+    clean: clean_cache::CleanCache,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -3191,6 +3198,8 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            pending_epoch: AtomicU64::new(0),
+            clean: clean_cache::CleanCache::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3304,6 +3313,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.pending_epoch.fetch_add(1, Ordering::AcqRel);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3328,6 +3338,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.pending_epoch.fetch_add(1, Ordering::AcqRel);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -4023,8 +4034,13 @@ impl Shadow {
         if from >= to {
             return true;
         }
-        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+        let watched = self.watched.load(Ordering::Relaxed);
+        if !matches!(watched, 1 | GUARDED) {
             return false;
+        }
+        let pending = self.pending_epoch.load(Ordering::Acquire);
+        if clean_cache::on() && self.clean.hit(from, to, pending, watched) {
+            return true;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
@@ -4032,6 +4048,9 @@ impl Shadow {
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        if same && clean_cache::on() && crate::watch::published(from, to) {
+            self.clean.remember(from, to, pending, watched);
+        }
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};

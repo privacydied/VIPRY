@@ -1724,7 +1724,7 @@ pub(crate) fn guarded(start: usize, end: usize) -> bool {
 
 /// Whether nothing of `[start, end)` can have been written since an asking
 /// noted it in the journal ([`PUBLISHED`]).
-fn published(start: usize, end: usize) -> bool {
+pub(crate) fn published(start: usize, end: usize) -> bool {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // (In this order: who puts something in beside a guard sets the one bit,
     // then clears the other, which an asking that is publishing the block may
