@@ -103,6 +103,12 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_WAVE64_PAIRED=1");
             bytes.push(0);
         }
+        // So is whether translated mesh shaders declare the payload of our
+        // amplification stage (`VICTORY_MESH_LAUNCH=1`): only while it is on.
+        if victory_shader::emit::mesh_launch() {
+            bytes.extend_from_slice(b"VICTORY_MESH_LAUNCH=1");
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes

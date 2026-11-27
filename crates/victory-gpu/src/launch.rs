@@ -1,6 +1,6 @@
 //! Mesh draws launched by the card: an amplification shader of ours
 //! (`launch.hlsl`, embedded as `launch.dxil`) in front of every translated
-//! mesh shader (`VICTORY_MESH_LAUNCH`, on by default; `0`: the clamp of
+//! mesh shader (`VICTORY_MESH_LAUNCH=1`, off by default: without it the clamp of
 //! `crate::indirect` before each record, as before).
 //!
 //! The title draws its meshes one indirect record a call, each from the
@@ -35,7 +35,7 @@
 //! An indirect call with a count buffer or more than one record keeps the
 //! clamp and runs on the same pipeline made without the amplification
 //! stage (`HostPipeline::plain`, made the first time one needs it): the
-//! translated mesh shader declares the payload either way
+//! translated mesh shader declares the payload while the switch is on
 //! (`victory_shader::emit::MESH_PAYLOAD_BYTES`), which the driver takes
 //! with or without an amplification shader.
 
@@ -58,10 +58,10 @@ pub(crate) const DIRECT_NONE: u32 = u32::MAX;
 const SPACE: u32 = victory_shader::emit::LAUNCH_SPACE;
 
 /// Whether mesh pipelines get the amplification stage and indirect mesh
-/// records are launched by it (`VICTORY_MESH_LAUNCH=0`: not).
+/// records are launched by it (`VICTORY_MESH_LAUNCH=1`; off by default,
+/// as the translated mesh shaders only declare the payload while it is on).
 pub(crate) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LAUNCH").is_none_or(|v| v != "0"))
+    victory_shader::emit::mesh_launch()
 }
 
 /// The amplification stage's code.
