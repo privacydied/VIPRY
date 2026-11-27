@@ -99,8 +99,9 @@ enum Command {
         warm: Option<PathBuf>,
     },
     /// Translate every shader found (as `translate` finds them) into the
-    /// shader cache, so that no run has to: a few minutes, once per change
-    /// of the translator.
+    /// shader cache, so that no run has to: a few minutes, once per version
+    /// of the translator. Translations an earlier build of the same version
+    /// cached are made again, and those that came out different counted.
     Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).

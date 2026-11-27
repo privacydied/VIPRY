@@ -448,6 +448,17 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
         failed.values().map(|f| f.0).sum::<usize>(),
         started.elapsed().as_secs_f64()
     );
+    let (stale, refreshed, changed) = victory_hle::modules::d3d12x::stale_shaders();
+    if stale > 0 {
+        println!(
+            "{refreshed} of {stale} translations an earlier build of the translator had cached translated again, {changed} came out different{}",
+            if changed > 0 {
+                " (a change of the translator's output: victory_shader::TRANSLATOR_VERSION should have been bumped)"
+            } else {
+                ""
+            }
+        );
+    }
     for (why, (n, hash)) in failed {
         println!("  {n:>5}  {why}  (e.g. {hash})");
     }
