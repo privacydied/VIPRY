@@ -25,6 +25,7 @@ use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
 // The title's bytes under flights' writes, compared and put in in one pass.
+mod small_bar;
 pub(crate) mod under_fused;
 use under_fused::{Compared, UNDER_NS, under_fused, under_ns, word_runs_put};
 
@@ -103,6 +104,8 @@ pub(crate) struct Shadow {
     wc: AtomicU8,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// Counted in `small_bar` (`VICTORY_SMALL_BUFFERS_BAR_MB`), with `mapped`.
+    small_bar: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -2701,6 +2704,9 @@ impl Drop for Shadow {
         } else if self.mapped {
             // A write-combined buffer's (`wc_bar`), counted with card sides.
             CARD_BYTES[0].fetch_sub(self.width(), Ordering::Relaxed);
+            if self.small_bar {
+                small_bar::released(self.width());
+            }
         }
         if let Some(card) = &mut self.card {
             if window {
@@ -3201,6 +3207,7 @@ impl Shadow {
             changes_only: Default::default(),
             wc: AtomicU8::new(0),
             mapped: false,
+            small_bar: false,
             place: None,
         }
     }
@@ -5300,6 +5307,19 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
             shadow.mapped = true;
+            *shadow.wc.get_mut() = 2;
+            entry.shadow = Some(Arc::new(shadow));
+            return entry.shadow.clone();
+        }
+        // Small write-combined buffers, as `wc_bar`'s, up to a cap
+        // (`VICTORY_SMALL_BUFFERS_BAR_MB`, off by default).
+        if let Some((buffer, data)) = small_bar::mapped_for(key.0, len, size) {
+            crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x} mapped on the card", key.0));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+            shadow.mapped = true;
+            shadow.small_bar = true;
             *shadow.wc.get_mut() = 2;
             entry.shadow = Some(Arc::new(shadow));
             return entry.shadow.clone();
