@@ -57,6 +57,8 @@ mod inplace;
 mod port;
 #[cfg(windows)]
 mod land;
+#[cfg(windows)]
+mod launch;
 pub mod list;
 pub mod object;
 pub mod pipeline;
