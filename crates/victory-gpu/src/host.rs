@@ -528,7 +528,11 @@ fn bury(finished: u64) {
         }
         retired.drain(..n).collect()
     };
-    drop(done);
+    if release::on() {
+        release::later(Box::new(done));
+    } else {
+        drop(done);
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -3881,6 +3885,7 @@ mod pacing;
 mod panel;
 mod place;
 pub(crate) mod rec;
+mod release;
 mod scratch_any;
 mod send;
 mod upq;
