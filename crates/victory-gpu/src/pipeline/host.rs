@@ -2045,7 +2045,7 @@ mod tests {
             out.unwrap()
         };
         let list = host.new_list().unwrap();
-        let list2 = windows::core::Interface::cast::<ID3D12GraphicsCommandList2>(&list.list).unwrap();
+        let list2 = windows::core::Interface::cast::<ID3D12GraphicsCommandList2>(&*list.list).unwrap();
         // SAFETY: an open list and live buffers.
         unsafe {
             let at = groups.GetGPUVirtualAddress();
