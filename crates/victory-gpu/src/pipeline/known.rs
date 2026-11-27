@@ -31,6 +31,8 @@ use windows::core::PCSTR;
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
+mod writer;
+
 const SHADERS: &str = "known-shaders.bin";
 const PIPELINES: &str = "known-pipelines.bin";
 /// Stages by their number in the files.
@@ -52,9 +54,14 @@ struct Book {
     added: usize,
 }
 
-static BOOK: OnceLock<Option<Mutex<Book>>> = OnceLock::new();
+struct Recorder {
+    book: Mutex<Book>,
+    writer: writer::Writer,
+}
 
-fn book() -> Option<&'static Mutex<Book>> {
+static BOOK: OnceLock<Option<Recorder>> = OnceLock::new();
+
+fn book() -> Option<&'static Recorder> {
     BOOK.get_or_init(|| {
         let dir = super::library::folder().filter(|_| on())?;
         std::fs::create_dir_all(&dir).ok()?;
@@ -75,26 +82,22 @@ fn book() -> Option<&'static Mutex<Book>> {
             }
         }
         tracing::info!(pipelines = keys.len(), shaders = shaders.len(), "title pipelines known from earlier runs");
-        let spawned = std::thread::Builder::new().name("victory-known".into()).spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                flush();
-            }
-        });
-        spawned.ok()?;
-        Some(Mutex::new(Book { dir, keys, shaders, new: Default::default(), added: 0 }))
+        Some(Recorder {
+            writer: writer::Writer::start(flush).ok()?,
+            book: Mutex::new(Book { dir, keys, shaders, new: Default::default(), added: 0 }),
+        })
     })
     .as_ref()
 }
 
 /// The title created a pipeline.
 pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) {
-    let Some(book) = book() else { return };
+    let Some(recorder) = book() else { return };
     let mut id = [0u8; 16];
     for (at, b) in id.iter_mut().enumerate() {
         *b = key.get(2 * at..2 * at + 2).and_then(|x| u8::from_str_radix(x, 16).ok()).unwrap_or(0);
     }
-    let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+    let mut book = recorder.book.lock().unwrap_or_else(|e| e.into_inner());
     if shaders.is_empty() || !book.keys.insert(id) {
         return;
     }
@@ -124,8 +127,15 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
 
 /// Appends pipelines noted since the last successful write, if the book is active.
 pub fn flush() {
-    let Some(Some(book)) = BOOK.get() else { return };
-    flush_book(book);
+    let Some(Some(recorder)) = BOOK.get() else { return };
+    flush_book(&recorder.book);
+}
+
+/// Gives the existing writer a short chance to save after the fatal GPU report.
+pub fn flush_on_gpu_failure() {
+    if let Some(Some(recorder)) = BOOK.get() {
+        recorder.writer.request_flush(std::time::Duration::from_millis(250));
+    }
 }
 
 fn flush_book(book: &Mutex<Book>) {
