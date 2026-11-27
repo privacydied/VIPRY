@@ -394,7 +394,7 @@ pub fn run(
 }
 
 /// Every shader found into the cache runs translate from.
-pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf>) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
@@ -404,6 +404,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);
     let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
+    let lines = Mutex::new(Vec::<String>::new());
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
@@ -431,8 +432,13 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                                     }
                                 }
                                 Err(why) => {
+                                    let hex = hash.to_hex()[..16].to_owned();
+                                    if list.is_some() {
+                                        let line = format!("{hex}\t{}{}\t{why}", entry.path().display(), job.label());
+                                        lock(&lines).push(line);
+                                    }
                                     let mut failed = lock(&failed);
-                                    failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
+                                    failed.entry(why).or_insert((0, hex)).0 += 1;
                                 }
                             }
                         }
@@ -442,6 +448,11 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
         }
     }
     let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
+    if let Some(list) = &list {
+        let mut lines = lines.into_inner().unwrap_or_else(|e| e.into_inner());
+        lines.sort();
+        std::fs::write(list, lines.join("\n") + "\n")?;
+    }
     println!(
         "{} shaders in the cache, {} do not translate, {:.0} s",
         done.load(Ordering::Relaxed),
