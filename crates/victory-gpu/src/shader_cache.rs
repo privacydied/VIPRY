@@ -161,6 +161,12 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_MESH_LAUNCH=1");
             bytes.push(0);
         }
+        // So is where a program's constant table starts
+        // (`VICTORY_CODE_TABLE_TAIL=1`): only while it is on, as above.
+        if victory_shader::emit::code_table_tail() {
+            bytes.extend_from_slice(b"VICTORY_CODE_TABLE_TAIL=1");
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         // Renderer port 5 (`VICTORY_PORT_CBV=1`): constant buffers read as raw
