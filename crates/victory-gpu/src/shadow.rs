@@ -4697,13 +4697,18 @@ impl Shadow {
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
         let was = title.clone();
-        let mut changed = false;
-        for (a, b) in outside(at, at + n, skip) {
-            let (a, b) = (a - at, b - at);
+        let changed = if skip.is_empty() {
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
-        }
+            merge_piece(gpu, held, &mut title[..])
+        } else {
+            let mut changed = false;
+            for (a, b) in outside(at, at + n, skip) {
+                let (a, b) = (a - at, b - at);
+                changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            }
+            changed
+        };
         if !mapped || !changed {
             return 0;
         }
