@@ -34,6 +34,7 @@ use std::sync::{Condvar, Mutex, RwLock};
 mod ask_noreset;
 // `VICTORY_COMMIT_MEMO`.
 pub(crate) mod commit_memo;
+mod held_absent;
 // Renderer port #6 (`VICTORY_PORT_GUARD`).
 mod port_guard;
 pub(crate) use port_guard::{port_guard, port_guard_line, port_guard_plan};
@@ -2710,7 +2711,7 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
         }
         if block < uncommitted_until {
             g.absent.insert(block);
-            if known_holes() && placeholder(block) {
+            if known_holes() && (held_absent::on() || placeholder(block)) {
                 g.held.insert(block);
             }
         }
