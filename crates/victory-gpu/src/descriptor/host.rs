@@ -1695,11 +1695,13 @@ fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
 /// the title puts parameter blocks at ring positions: a raw view of 128 bytes
 /// at 8 (the colour table bakes'), structured ones of elements that are no
 /// divisor of their place (the culling's 456-byte constants). Such a view gets
-/// a copy of its own bytes ([`crate::shadow::exact`]). (A typed view of
-/// 12-byte elements at a multiple of 16 that is none of 12 is one of them: it
-/// was passed over, and stayed null.)
-fn off_elements(offset: u64, stride: u32, raw: bool, element: u64) -> bool {
-    if raw {
+/// a copy of its own bytes ([`crate::shadow::exact`]). With no raw twin,
+/// an untyped structured view also needs that copy to be 16-byte aligned.
+/// A typed view of 12-byte elements also needs its own copy when its start
+/// is a multiple of 16 but not a multiple of 12.
+fn off_elements(offset: u64, stride: u32, raw: bool, element: u64, has_raw_twins: bool) -> bool {
+    let needs_raw = stride > 0 && stride.is_multiple_of(4) && !has_raw_twins;
+    if raw || needs_raw {
         !offset.is_multiple_of(16)
     } else if stride > 0 {
         !offset.is_multiple_of(16) && !offset.is_multiple_of(u64::from(stride))
@@ -1736,7 +1738,13 @@ fn view_home(
         return shadow;
     }
     let element = crate::resource::element(format).map_or(0, |(bytes, _)| bytes);
-    if !off_elements(offset, stride, raw, element) {
+    // Pick the same copy when creating the descriptor and when refreshing it,
+    // even if the latter lookup comes before the title creates its view heap.
+    if stride > 0 {
+        probe_view_limit();
+    }
+    let has_raw_twins = victory_shader::emit::raw_views() != 0;
+    if !off_elements(offset, stride, raw, element, has_raw_twins) {
         return shadow;
     }
     crate::shadow::exact(start, len).unwrap_or(shadow)
@@ -6147,18 +6155,22 @@ mod tests {
     #[test]
     fn views_off_their_elements_are_told() {
         // the colour table bakes' parameter block: raw, 8 bytes into its window
-        assert!(off_elements(8, 0, true, 4));
-        assert!(!off_elements(0, 0, true, 4));
-        assert!(!off_elements(48, 0, true, 4));
+        assert!(off_elements(8, 0, true, 4, true));
+        assert!(!off_elements(0, 0, true, 4, true));
+        assert!(!off_elements(48, 0, true, 4, true));
         // 456-byte elements: at one of them, on 16 bytes, at neither
-        assert!(!off_elements(456, 456, false, 0));
-        assert!(!off_elements(32, 456, false, 0));
-        assert!(off_elements(100, 456, false, 0));
+        assert!(!off_elements(456, 456, false, 0, true));
+        assert!(!off_elements(32, 456, false, 0, true));
+        assert!(off_elements(100, 456, false, 0, true));
         // A typed view of 12-byte elements on 16 bytes and not on an element.
-        assert!(off_elements(23_702_896, 0, false, 12));
-        assert!(!off_elements(48, 0, false, 12));
-        assert!(!off_elements(12, 0, false, 4));
-        assert!(off_elements(12, 0, false, 8));
+        assert!(off_elements(23_702_896, 0, false, 12, true));
+        assert!(!off_elements(48, 0, false, 12, true));
+        assert!(!off_elements(12, 0, false, 4, true));
+        assert!(off_elements(12, 0, false, 8, true));
+        // With no raw twin, a structured view is read as raw at its own slot.
+        assert!(off_elements(56, 56, false, 0, false));
+        assert!(!off_elements(56, 56, false, 0, true));
+        assert!(!off_elements(112, 56, false, 0, false));
     }
 
     /// Such a view is made on a copy of its own bytes, and that copy is the one
@@ -6205,6 +6217,17 @@ mod tests {
             assert_eq!(width(&v), len.next_multiple_of(256));
             let (copy, address, bytes) = buffer_copy(&v).unwrap();
             assert_eq!((copy.span(), address, bytes), ((start + off, len), start + off, len));
+        }
+        // Offset 456 is on a structured element but eight bytes past a raw
+        // view boundary. Without twins, the slot itself must use a raw view.
+        let v = view(start + 456, false);
+        let (copy, address, bytes) = buffer_copy(&v).unwrap();
+        assert_eq!((address, bytes), (start + 456, 4 * 456));
+        if victory_shader::emit::raw_views() == 0 {
+            assert_eq!(copy.span(), (address, bytes));
+            assert_eq!(width(&v), bytes.next_multiple_of(256));
+        } else {
+            assert_ne!(copy.span().0, address, "its buffer's copy");
         }
         for (off, raw) in [(16, true), (32, false)] {
             let v = view(start + off, raw);
