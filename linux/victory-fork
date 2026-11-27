@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# victory-fork: keep several VIctory forks side by side and pick which one Steam runs.
+#
+#   victory-fork list                      forks, build state, which one is current
+#   victory-fork add <name> <git-url> [branch]
+#   victory-fork add-prebuilt <name> <path-to-victory.exe>
+#   victory-fork add-recipe <name>         local merge of several forks/PRs (recipes/<name>.recipe)
+#   victory-fork update <name> [ref]       fetch and move the fork to its branch tip (or a commit/tag)
+#   victory-fork build <name>              build the fork for Windows (cargo-xwin) into builds/<name>
+#   victory-fork use <name>                make <name> the one Steam starts
+#   victory-fork get <name> [ref]          update + build + use, in one step
+#   victory-fork run [name] [seconds]     start it outside Steam (same Proton + prefix), log in logs/
+#   victory-fork env <name>                open the fork's switch file in $EDITOR
+#   victory-fork remove <name>             forget a fork (keeps its cache)
+#
+# Layout (all under $VICTORY_HOME, default ~/Games/victory):
+#   forks.conf          name kind source branch
+#   .repo/              one git store; each fork is a remote
+#   forks/<name>/       git worktree of that fork
+#   builds/<name>/      victory.exe that Steam runs (+ BUILD_INFO)
+#   current ->          symlink to builds/<name>  (Steam shortcut points at current/victory.exe)
+#   env/common.env      paths shared by all forks
+#   env/<name>.env      VICTORY_* switches + VICTORY_ARGS for that fork
+#   cache/<name>/       translated shaders etc., kept per fork
+#   data/               saves, shared by all forks
+set -euo pipefail
+
+V="${VICTORY_HOME:-$HOME/Games/victory}"
+CONF="$V/forks.conf"
+REPO="$V/.repo"
+TARGET=x86_64-pc-windows-msvc
+export RUSTUP_HOME="$V/.rust/rustup" CARGO_HOME="$V/.rust/cargo"
+export PATH="$CARGO_HOME/bin:$PATH"
+export XWIN_CACHE_DIR="$V/.xwin"
+
+die() { echo "victory-fork: $*" >&2; exit 1; }
+need_name() { [[ -n "${1:-}" ]] || die "name missing"; grep -qP "^\\Q$1\\E\\t" "$CONF" || die "no fork named '$1' (see: victory-fork list)"; }
+field() { awk -F'\t' -v n="$1" -v f="$2" '$1==n {print $f}' "$CONF"; }
+current() { [[ -L "$V/current" ]] && basename "$(readlink "$V/current")" || true; }
+
+seed_env() {
+    local name="$1" from="${2:-}"
+    [[ -f "$V/env/$name.env" ]] && return
+    if [[ -n "$from" && -f "$V/env/$from.env" ]]; then
+        cp "$V/env/$from.env" "$V/env/$name.env"
+        sed -i "1s|.*|# Switches for fork '$name' (copied from '$from'; check this fork's README/play script).|" "$V/env/$name.env"
+    else
+        printf '# Switches for fork %s. KEY=value lines, sourced by bash.\n# Extra arguments after "run <exe>":\nVICTORY_ARGS="--execute"\n' "$name" > "$V/env/$name.env"
+    fi
+}
+
+cmd_list() {
+    local cur; cur="$(current)"
+    printf '%-2s %-16s %-9s %-10s %-10s %s\n' "" NAME KIND BUILT COMMIT SOURCE
+    while IFS=$'\t' read -r name kind src branch _; do
+        [[ -z "$name" || "$name" == \#* ]] && continue
+        local mark="" built="no" commit="-"
+        [[ "$name" == "$cur" ]] && mark="*"
+        [[ -f "$V/builds/$name/victory.exe" ]] && built="yes"
+        if [[ "$kind" != prebuilt && -d "$V/forks/$name" ]]; then commit="$(git -C "$V/forks/$name" rev-parse --short HEAD)"; fi
+        [[ "$kind" == git ]] && src="$src@$branch"
+        printf '%-2s %-16s %-9s %-10s %-10s %s\n' "$mark" "$name" "$kind" "$built" "$commit" "$src"
+    done < "$CONF"
+}
+
+cmd_add() {
+    local name="${1:-}" url="${2:-}" branch="${3:-}"
+    [[ -n "$name" && -n "$url" ]] || die "usage: add <name> <git-url> [branch]"
+    grep -qE "^$name[[:space:]]" "$CONF" && die "fork '$name' already exists"
+    if [[ -z "$branch" ]]; then
+        branch="$(git ls-remote --symref "$url" HEAD | awk '/^ref:/ {sub("refs/heads/","",$2); print $2}')"
+        [[ -n "$branch" ]] || die "cannot read default branch of $url; pass one"
+    fi
+    git -C "$REPO" remote add "$name" "$url"
+    printf '%s\tgit\t%s\t%s\n' "$name" "$url" "$branch" >> "$CONF"
+    seed_env "$name" "$(current)"
+    echo "added $name ($url, branch $branch). Next: victory-fork get $name"
+}
+
+cmd_add_prebuilt() {
+    local name="${1:-}" exe="${2:-}"
+    [[ -n "$name" && -f "$exe" ]] || die "usage: add-prebuilt <name> <path-to-exe>"
+    grep -qE "^$name[[:space:]]" "$CONF" && die "fork '$name' already exists"
+    exe="$(realpath "$exe")"
+    printf '%s\tprebuilt\t%s\t-\n' "$name" "$exe" >> "$CONF"
+    seed_env "$name"
+    cmd_build "$name"
+}
+
+# Recipe fork: recipes/<name>.recipe, one step per line, applied in order onto local branch <name>:
+#   base   <remote> <url> <branch>     start from this branch tip (first line)
+#   merge  <remote> <url> <branch>     git merge --no-edit that branch
+#   pick   <remote> <url> <commit>     git cherry-pick -x that commit (fetched from the remote)
+#   pr     <owner/repo> <number>       merge GitHub pull request head
+# A conflict stops the update and leaves the worktree mid-merge for hand-fixing.
+remote_for() {  # remote url -> ensure remote exists, fetch it
+    git -C "$REPO" remote get-url "$1" >/dev/null 2>&1 || git -C "$REPO" remote add "$1" "$2"
+    git -C "$REPO" fetch --quiet "$1"
+}
+cmd_update_recipe() {
+    local name="$1" recipe; recipe="$V/$(field "$name" 3)"
+    [[ -f "$recipe" ]] || die "no recipe $recipe"
+    local wt="$V/forks/$name" first=1
+    while read -r op a b c _; do
+        [[ -z "$op" || "$op" == \#* ]] && continue
+        case "$op" in
+            base)
+                [[ $first == 1 ]] || die "base must be the first step"
+                remote_for "$a" "$b"
+                if [[ ! -d "$wt" ]]; then
+                    git -C "$REPO" worktree add --quiet -B "$name" "$wt" "$a/$c"
+                else
+                    git -C "$wt" merge --abort 2>/dev/null; git -C "$wt" cherry-pick --abort 2>/dev/null
+                    git -C "$wt" checkout --quiet -B "$name" "$a/$c"
+                fi
+                echo "  base  $a/$c $(git -C "$wt" rev-parse --short HEAD)" ;;
+            merge) remote_for "$a" "$b"
+                git -C "$wt" merge --quiet --no-edit "$a/$c" || die "merge $a/$c conflicts in $wt"
+                echo "  merge $a/$c" ;;
+            pick) remote_for "$a" "$b"
+                git -C "$wt" cherry-pick -x "$c" >/dev/null || die "pick $c conflicts in $wt"
+                echo "  pick  $c" ;;
+            pr) git -C "$REPO" fetch --quiet "https://github.com/$a" "pull/$b/head"
+                git -C "$wt" merge --quiet --no-edit -m "Merge $a#$b" FETCH_HEAD || die "PR $a#$b conflicts in $wt"
+                echo "  pr    $a#$b" ;;
+            *) die "unknown recipe step '$op'" ;;
+        esac
+        first=0
+    done < "$recipe"
+    echo "$name at $(git -C "$wt" log --oneline -1)"
+}
+
+cmd_add_recipe() {
+    local name="${1:-}"; [[ -n "$name" ]] || die "usage: add-recipe <name>"
+    grep -qP "^\\Q$name\\E\\t" "$CONF" && die "fork '$name' already exists"
+    mkdir -p "$V/recipes"
+    [[ -f "$V/recipes/$name.recipe" ]] || printf '# steps: base|merge|pick|pr (see victory-fork)\nbase belobug https://github.com/Belobug/VIctory-Belobug-AMD a-publier\n' > "$V/recipes/$name.recipe"
+    printf '%s\trecipe\trecipes/%s.recipe\t-\n' "$name" "$name" >> "$CONF"
+    seed_env "$name"
+    echo "added $name. Edit $V/recipes/$name.recipe, then: victory-fork get $name"
+}
+
+cmd_update() {
+    need_name "${1:-}"; local name="$1" ref="${2:-}"
+    [[ "$(field "$name" 2)" == recipe ]] && { cmd_update_recipe "$name"; return; }
+    [[ "$(field "$name" 2)" == git ]] || { echo "$name is prebuilt; nothing to fetch"; return; }
+    local branch; branch="$(field "$name" 4)"
+    git -C "$REPO" fetch --quiet "$name" "+refs/heads/$branch:refs/remotes/$name/$branch"
+    [[ -n "$ref" ]] || ref="$name/$branch"
+    if [[ ! -d "$V/forks/$name" ]]; then
+        git -C "$REPO" worktree add --quiet --detach "$V/forks/$name" "$ref"
+    else
+        git -C "$V/forks/$name" checkout --quiet --detach "$ref"
+    fi
+    echo "$name at $(git -C "$V/forks/$name" log --oneline -1)"
+}
+
+# Microsoft d3dcompiler_47.dll: Wine's builtin cannot compile the HLSL with
+# [RootSignature] that VIctory builds at run time (composer, card-awake, copies: E_FAIL).
+copy_redist() { for f in "$V"/redist/*.dll; do [[ -f "$f" ]] && cp -f "$f" "$1/"; done; return 0; }
+
+cmd_build() {
+    need_name "${1:-}"; local name="$1" out="$V/builds/$1"
+    mkdir -p "$out"
+    if [[ "$(field "$name" 2)" == prebuilt ]]; then
+        local src; src="$(field "$name" 3)"
+        cp -f "$src" "$out/victory.exe"
+        for dll in "$(dirname "$src")"/*.dll; do [[ -f "$dll" ]] && cp -f "$dll" "$out/"; done
+        copy_redist "$out"
+        printf 'prebuilt %s\n%s\n' "$src" "$(date -Is)" > "$out/BUILD_INFO"
+        echo "$name: copied prebuilt $src"; return
+    fi
+    local wt="$V/forks/$name"
+    [[ -d "$wt" ]] || cmd_update "$name"
+    command -v cargo-xwin >/dev/null || die "cargo-xwin missing in $CARGO_HOME/bin"
+    local profile=release args=(--release)
+    if grep -q '^\[profile\.diag\]' "$wt/Cargo.toml"; then
+        profile=diag; args=(--profile diag --features diagnostics)
+    fi
+    # Per fork: VICTORY_BUILD_PROFILE=release|diag and VICTORY_BUILD_FEATURES=... in env/<name>.env
+    local want feats
+    want="$(sed -n 's/^VICTORY_BUILD_PROFILE=//p' "$V/env/$name.env" 2>/dev/null | tr -d '"' | tail -1)"
+    feats="$(sed -n 's/^VICTORY_BUILD_FEATURES=//p' "$V/env/$name.env" 2>/dev/null | tr -d '"' | tail -1)"
+    want="${VICTORY_BUILD_PROFILE:-$want}"
+    [[ "$want" == release ]] && { profile=release; args=(--release); }
+    [[ -n "$feats" ]] && args+=(--features "$feats")
+    echo "$name: building $profile at $(git -C "$wt" rev-parse --short HEAD)"
+    (cd "$wt" && rustup target add --quiet "$TARGET" >/dev/null 2>&1 || true
+     cd "$wt" && XWIN_ARCH=x86_64 cargo xwin build --locked --target "$TARGET" -p victory "${args[@]}")
+    local exe="$wt/target/$TARGET/$profile/victory.exe"
+    [[ -f "$exe" ]] || die "build ended without $exe"
+    cp -f "$exe" "$out/victory.exe"
+    [[ -f "${exe%.exe}.pdb" ]] && cp -f "${exe%.exe}.pdb" "$out/"
+    copy_redist "$out"
+    printf 'git %s %s\nprofile %s\n%s\n' "$(field "$name" 3)" "$(git -C "$wt" rev-parse HEAD)" "$profile" "$(date -Is)" > "$out/BUILD_INFO"
+    echo "$name: built $out/victory.exe"
+}
+
+cmd_use() {
+    need_name "${1:-}"
+    [[ -f "$V/builds/$1/victory.exe" ]] || die "$1 has no build; run: victory-fork build $1"
+    ln -sfn "builds/$1" "$V/current"
+    echo "Steam now starts: $1 ($(head -1 "$V/builds/$1/BUILD_INFO"))"
+}
+
+# Run the current (or named) fork outside Steam, same Proton Experimental + prefix, full log to logs/.
+cmd_run() {
+    local fork="${1:-$(current)}" secs="${2:-0}"
+    need_name "$fork"
+    local PF="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/files"
+    local appid; appid="$(cat "$V/.steam-appid" 2>/dev/null)"
+    export WINEPREFIX="$HOME/.local/share/Steam/steamapps/compatdata/$appid/pfx"
+    [[ -d "$WINEPREFIX" ]] || die "no Proton prefix yet; start the game from Steam once"
+    export WINEDLLPATH="$PF/lib/vkd3d:$PF/lib/wine" WINEDEBUG="${WINEDEBUG:--all}"
+    # What Proton sets itself: DXVK dxgi + vkd3d-proton d3d12 from the prefix, not Wine's builtins.
+    export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3d11,d3d10core,d3d9=n${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+    local t=(); [[ "$secs" != 0 ]] && t=(timeout "$secs")
+    VICTORY_FORK="$fork" "${t[@]}" "$V/bin/steam-launch" "$PF/bin/wine" "$V/builds/$fork/victory.exe"
+    echo "log: $(ls -t "$V"/logs/*-"$fork".log | head -1)"
+}
+
+cmd_get() { cmd_update "$@"; cmd_build "$1"; cmd_use "$1"; }
+
+cmd_env() { need_name "${1:-}"; seed_env "$1"; "${EDITOR:-nano}" "$V/env/$1.env"; }
+
+cmd_remove() {
+    need_name "${1:-}"; local name="$1"
+    [[ "$(current)" == "$name" ]] && die "$name is current; switch first"
+    if [[ "$(field "$name" 2)" != prebuilt ]]; then
+        git -C "$REPO" worktree remove --force "$V/forks/$name" 2>/dev/null || true
+        git -C "$REPO" remote remove "$name" 2>/dev/null || true
+    fi
+    rm -rf "$V/builds/$name"
+    awk -F'\t' -v n="$name" '$1!=n' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+    echo "removed $name (env/$name.env and cache/$name kept)"
+}
+
+sub="${1:-list}"; shift || true
+case "$sub" in
+    list|ls) cmd_list ;;
+    add) cmd_add "$@" ;;
+    add-prebuilt) cmd_add_prebuilt "$@" ;;
+    add-recipe) cmd_add_recipe "$@" ;;
+    update) cmd_update "$@" ;;
+    build) cmd_build "$@" ;;
+    use) cmd_use "$@" ;;
+    get) cmd_get "$@" ;;
+    run) cmd_run "$@" ;;
+    env) cmd_env "$@" ;;
+    remove|rm) cmd_remove "$@" ;;
+    *) sed -n '2,15p' "$0"; exit 1 ;;
+esac

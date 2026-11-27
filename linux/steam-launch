@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Steam launch wrapper. Steam launch options:  /home/pry/Games/victory/bin/steam-launch %command%
+# Starts the fork that `victory-fork use` picked (or VICTORY_FORK=<name> %command% for a one-off),
+# with env/common.env + env/<fork>.env applied, and appends: run <game exe> $VICTORY_ARGS
+set -uo pipefail
+V="${VICTORY_HOME:-$HOME/Games/victory}"
+
+fork="${VICTORY_FORK:-$(basename "$(readlink "$V/current")")}"
+[[ -f "$V/builds/$fork/victory.exe" ]] || { echo "steam-launch: no build for fork '$fork'" >&2; exit 1; }
+
+set -a
+# shellcheck disable=SC1090
+source "$V/env/common.env"
+[[ -f "$V/env/$fork.env" ]] && source "$V/env/$fork.env"
+set +a
+
+# Linux path -> Wine Z: path
+winpath() { local p="$1"; p="${p//\//\\}"; printf 'Z:%s' "$p"; }
+
+mkdir -p "$V/cache/$fork" "$V/data"
+export VICTORY_GAME_DIR="$(winpath "$GAME_DIR")"
+export VICTORY_CACHE_DIR="$(winpath "$V/cache/$fork")"
+export VICTORY_DATA_DIR="$(winpath "$V/data")"
+[[ -n "${FIDELITYFX_DIR:-}" ]] && export VICTORY_FIDELITYFX_DIR="$(winpath "$FIDELITYFX_DIR")"
+
+# Native d3dcompiler_47 (shipped next to victory.exe): Wine's builtin fails VIctory's run-time HLSL.
+export WINEDLLOVERRIDES="d3dcompiler_47=n${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+
+# Swap the shortcut's current/victory.exe for the chosen fork's exe (matters only with VICTORY_FORK).
+cmd=()
+for a in "$@"; do
+    if [[ "$a" == "$V/current/victory.exe" || "$a" == *"/current/victory.exe" ]]; then
+        a="$V/builds/$fork/victory.exe"
+    fi
+    cmd+=("$a")
+done
+
+# What to run: normally the game; VICTORY_MODE=shaders|warm pre-builds caches instead.
+mode="${VICTORY_MODE:-run}"
+case "$mode" in
+    run)     tail=(run "$VICTORY_GAME_DIR\\game_scarlett_master.exe") ;;
+    shaders) tail=(shaders "$VICTORY_GAME_DIR\\shaders.rpf"); VICTORY_ARGS="" ;;
+    warm)    tail=(warm --used); VICTORY_ARGS="" ;;
+    *)       tail=("$mode"); VICTORY_ARGS="" ;;
+esac
+# shellcheck disable=SC2206
+extra=(${VICTORY_ARGS:-})
+
+log="$V/logs/$(date +%Y%m%d-%H%M%S)-$fork.log"
+mkdir -p "$V/logs"
+{
+    echo "fork=$fork mode=$mode"; head -2 "$V/builds/$fork/BUILD_INFO"
+    printf '%q ' "${cmd[@]}" "${tail[@]}" "${extra[@]}"; echo
+    env | grep -E '^(VICTORY_|RUST_|WINEDLLOVERRIDES|PROTON_|VKD3D_|DXVK_)' | sort
+} > "$log"
+exec "${cmd[@]}" "${tail[@]}" "${extra[@]}" >> "$log" 2>&1
