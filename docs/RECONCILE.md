@@ -67,7 +67,7 @@ klbf-lab (mostly bench/README), VItoriaBr (ports of trustno1/fxceless already ab
 
 Two runs of `--profile diag --features diagnostics`, `/proc/<pid>/smaps` every 15 s,
 ~7 min into the world. PC: 31 GiB RAM, 16-20 GB swap already used by other programs
-before launch (harvestr python 3.9 GB, Firefox ~5 GB).
+before launch.
 
 | | Baseline | `VICTORY_WINDOW_KB=1024` + `VICTORY_WINDOW_TAILS=1` |
 |---|---|---|
