@@ -928,6 +928,8 @@ mod library;
 mod make;
 #[cfg(windows)]
 mod spare;
+#[cfg(windows)]
+mod wait_each;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

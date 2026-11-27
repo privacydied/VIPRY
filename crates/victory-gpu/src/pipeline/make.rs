@@ -56,6 +56,8 @@ pub(crate) struct Pending {
     donor: OnceLock<Arc<Pending>>,
     usage: OnceLock<super::library::Usage>,
     replayed: AtomicBool,
+    /// Microseconds first uses waited for it, over all frames ([`super::wait_each`]).
+    waited_us: AtomicU64,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -184,6 +186,7 @@ impl Pending {
             donor: OnceLock::new(),
             usage: OnceLock::new(),
             replayed: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -519,6 +522,14 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() || super::spare::given_up(p) {
         return;
     }
+    let own = if screen {
+        Duration::MAX
+    } else {
+        super::wait_each::left(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)))
+    };
+    if own.is_zero() {
+        return;
+    }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
@@ -529,7 +540,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(own);
         if shared {
             spent.1 += left;
         }
@@ -552,6 +563,9 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     waiting.end();
+    if !screen {
+        p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+    }
     super::drop_why::waited(started.elapsed(), p.made.get().is_some());
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
