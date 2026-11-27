@@ -933,3 +933,6 @@ fn lds_accesses_after_the_last_plain_write_need_no_meeting() {
     assert_eq!(unstable.iter().map(|x| x.0).collect::<Vec<_>>(), ["ds_read_b32"]);
     assert!(unordered[0].1 > 0x10, "the read after the barrier");
 }
+
+#[path = "paired_tests.rs"]
+mod paired;

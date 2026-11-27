@@ -94,6 +94,12 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
             bytes.push(0);
         }
+        // So is whether a wave64 program the 32-lane forms refuse is paired
+        // (`VICTORY_WAVE64_PAIRED=1`): only while it is on, as above.
+        if victory_shader::emit::paired_compute_enabled() {
+            bytes.extend_from_slice(b"VICTORY_WAVE64_PAIRED=1");
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes
