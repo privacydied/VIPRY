@@ -3235,7 +3235,9 @@ pub fn title_memory_made_real(at: usize, len: usize) {
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 pub(crate) fn install() {
-    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::Foundation::{
+        EXCEPTION_ACCESS_VIOLATION, NTSTATUS, STATUS_GUARD_PAGE_VIOLATION,
+    };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         EXCEPTION_POINTERS,
@@ -3274,7 +3276,13 @@ pub(crate) fn install() {
             || r.ExceptionInformation[0] != WRITE
         {
             return match ours {
-                Some(exit) => fail(exit),
+                Some(exit) => {
+                    // A guard page of title memory fails the copy; the fault cleared its flag.
+                    if r.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION && r.NumberParameters >= 2 {
+                        crate::guard::rearm(r.ExceptionInformation[1]);
+                    }
+                    fail(exit)
+                }
                 None if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
                     && r.NumberParameters >= 2
                     && r.ExceptionInformation[0] == READ
