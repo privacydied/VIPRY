@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod exact_fast;
 // The title's bytes under flights' writes, compared and put in in one pass.
 mod small_bar;
 pub(crate) mod under_fused;
@@ -5732,6 +5733,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    if exact_fast::on() {
+        return exact_fast::exact(address, len, MANY, LATELY);
+    }
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let (tick, map) = &mut *guard;
     *tick += 1;
@@ -5770,7 +5774,11 @@ pub(crate) fn exact_line(frames: f64) {
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = if exact_fast::on() {
+        exact_fast::kept()
+    } else {
+        EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len()
+    };
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
