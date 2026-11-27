@@ -1,6 +1,6 @@
 //! `victory play`, and `victory` started with no command at all (a double
 //! click): the title with the settings this fork plays with, so that the
-//! program alone, put beside the title's `game_scarlett_master.exe`, is all
+//! program alone, put beside the title's executable, is all
 //! there is to start. What `scripts\play-foxhound.ps1` does, built in.
 //!
 //! Nothing is written beside the program or into the title's folder: the
@@ -96,7 +96,7 @@ const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performanc
 
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct Play {
-    /// The title's executable. Without it: `game_scarlett_master.exe` beside
+    /// The title's executable. Without it: the title's executable beside
     /// this program, else in the current folder.
     exe: Option<PathBuf>,
     /// The Series S profile (1280x720 inside: faster, softer).

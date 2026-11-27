@@ -75,7 +75,7 @@ fn leave_out() -> &'static [String] {
 }
 
 /// The light in the water's volume, in tiles (`water_shading:CS_TransmissionVolumetrics_Tiled`
-/// and `_Tiled_LocalLights`, GTA VI 1.0.2.1): programs of one 64-lane wave a group, which a
+/// and `_Tiled_LocalLights`, version 1.0.2.1): programs of one 64-lane wave a group, which a
 /// host of 32-lane waves gets in the wave-wide form only (`victory_shader::emit`, 4 and 7
 /// branches taken wave-wide). In that form they leave whole tiles of open water dark, around
 /// boats, along shores and under bridges, and take about 15 ms of the card a frame (RTX 5070,

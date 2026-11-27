@@ -42,7 +42,7 @@ What is known to be wrong:
 - An NVIDIA GeForce RTX GPU with a recent driver for DLSS (RTX 40 or later for Frame Generation, with
   hardware-accelerated GPU scheduling on). Any Direct3D 12 GPU with shader model 6.6 and mesh shaders runs the
   layer without DLSS.
-- **Your own dump** of the title's Xbox Series build v1.0.2.1 (the folder with `game_scarlett_master.exe`).
+- **Your own dump** of the title's Xbox Series build v1.0.2.1 (the folder with the title's executable).
   Other builds may start, but the image patches (1440p output, FidelityFX path, frame rate) check every byte
   they change and leave a differing build alone.
 - [Rust](https://rustup.rs) (the toolchain is pinned in `rust-toolchain.toml`; rustup fetches it), and the
@@ -93,7 +93,7 @@ The diagnostics build (frame timelines, captures, GPU timing) is optional:
 ## Run
 
 ```powershell
-.\scripts\play-foxhound.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
+.\scripts\play-foxhound.ps1 -Exe '<your dump>\<the title's executable>'
 ```
 
 | Option | What |

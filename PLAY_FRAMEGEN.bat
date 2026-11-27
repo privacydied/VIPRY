@@ -1,10 +1,10 @@
 @echo off
-rem One-click GTA VI on VIctory-NVIDIA (DLSS + frame generation). ASCII only.
+rem One-click start of the title on VIctory-NVIDIA (DLSS + frame generation). ASCII only.
 rem   PLAY_FRAMEGEN.bat          menu
 rem   PLAY_FRAMEGEN.bat 1..6     start that mode directly
 rem   PLAY_FRAMEGEN.bat check    only show paths and what is ready
 setlocal
-set "PS1=%~dp0scripts\play-gta6-framegen.ps1"
+set "PS1=%~dp0scripts\play-framegen.ps1"
 set "PSH=powershell"
 where pwsh >nul 2>nul && set "PSH=pwsh"
 if not exist "%PS1%" (
@@ -21,7 +21,7 @@ set "PICK=%~1"
 if not "%PICK%"=="" goto :run
 
 echo ================================================
-echo   GTA VI - VIctory-NVIDIA, DLSS + frame generation
+echo   VIctory-NVIDIA, DLSS + frame generation
 echo   (RTX 50: frame generation 4x automatically)
 echo ================================================
 echo   1. Series X 1440p + DLSS Quality + frame gen   (recommended)

@@ -1,7 +1,7 @@
 //! Renderer port #1: the title's 32-bit graphics heap as the card's own
 //! memory (`VICTORY_PORT_CONSTANTS`, off by default).
 //!
-//! What the title does (game_scarlett_master.exe, the routine at image
+//! What the title does (the title's executable, the routine at image
 //! +0x1e86440, reached at its start): one `XMemVirtualAlloc` of the five
 //! sizes it is given together (kind 0x42000: a reservation of 64 KiB
 //! pages, flags 7: graphics memory below 4 GiB, 185 MB at 0x34310000 in

@@ -625,7 +625,7 @@ pub fn emit(
         // Both archived kernels use one logical wave per group and have
         // validated wave32 PSOs on RTX. Explicit policy wins.
         // The volumetric light's two tiled programs (`CS_TransmissionVolumetrics_Tiled`
-        // and `_Tiled_LocalLights`, GTA VI 1.0.2.1) are of that shape too: groups of 64,
+        // and `_Tiled_LocalLights`, version 1.0.2.1) are of that shape too: groups of 64,
         // an LDS read and write in one lane-branch region, so no other form translates
         // them on 32-lane hosts and their dispatches were dropped (no volumetric light
         // or fog on NVIDIA). Widened, they translate (4 and 7 branches taken wave-wide).

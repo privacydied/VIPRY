@@ -131,7 +131,7 @@ enum Command {
     },
     /// Play: the title with this fork's settings, as a start with no
     /// command at all does (a double click on the program beside the
-    /// title's `game_scarlett_master.exe`). F1 in the game is the settings
+    /// title's executable). F1 in the game is the settings
     /// menu, F3 the stats panel.
     #[cfg(windows)]
     Play(play::Play),

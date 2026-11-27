@@ -1,8 +1,8 @@
 //! The title's frame rate (`VICTORY_FRAME_INTERVAL_MS`, off without it): the
-//! rate Grand Theft Auto VI asks for is a setting of its own, and two
+//! rate the title asks for is a setting of its own, and two
 //! places in its code are changed at load to read another.
 //!
-//! What the title does (game_scarlett_master.exe 1.0.2.1, image offsets):
+//! What the title does (the title's executable 1.0.2.1, image offsets):
 //!
 //! - Its graphics settings hold a frame rate (+0x210 of the settings object,
 //!   30 on Series X). Two functions that apply the settings, +0x1e0fb30 and
@@ -109,7 +109,7 @@ pub enum Kind {
     SimRate,
 }
 
-/// The three reads (game_scarlett_master.exe 1.0.2.1, image offsets).
+/// The three reads (the title's executable 1.0.2.1, image offsets).
 pub const SITES: [Site; 3] = [
     // +0x1e0fb30: mov eax, [rdi+210h] ... mov [+0x98f84ac], eax
     Site {

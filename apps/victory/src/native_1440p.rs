@@ -1,4 +1,4 @@
-//! A 2560x1440 SDR display for the supported Series X retail image (GTA VI
+//! A 2560x1440 SDR display for the supported Series X retail image (version
 //! 1.0.2.1): the title presents at 3840x2160 on Series X, its scene drawn at
 //! 2560x1440 and scaled up by its own temporal pass. With 1440p asked for
 //! (`VICTORY_NATIVE_1440P=1`, or `VICTORY_RENDER_1080P=1` for a 1920x1080
