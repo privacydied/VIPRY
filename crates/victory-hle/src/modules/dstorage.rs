@@ -1065,12 +1065,20 @@ impl Lane {
 /// the file and the destination. Raw reads go straight to their
 /// destination, memory sources need none (as on the console).
 fn staging_bytes(request: &Request) -> u64 {
+    // Also counted (from belobug e136a555): the zlib output a BCPack decode
+    // reads, which is buffered here too, so loading held more host memory
+    // than the budget said. The destination of a physical-page request is
+    // not counted: it is written in place through one view in the usual case
+    // (`into_pages`), and counting it would hold back streaming for no memory.
+    let mut bytes = 0;
     let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
     if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
-    } else {
-        0
+        bytes += u64::from(request.source_size);
     }
+    if request.options & ZLIB != 0 && request.options & BCPACK != 0 {
+        bytes += u64::from(request.intermediate_size);
+    }
+    bytes
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the
@@ -2371,6 +2379,19 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn staging_counts_the_bcpack_intermediate() {
+        let mut r = request(ZLIB | BCPACK, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
+        (r.source_size, r.intermediate_size, r.destination_size) = (100, 300, 900);
+        assert_eq!(staging_bytes(&r), 400);
+        // Zlib alone decodes straight to its destination: no intermediate.
+        r.options = ZLIB;
+        assert_eq!(staging_bytes(&r), 100);
+        // From memory: only the intermediate is buffered here.
+        r.options = ZLIB | BCPACK | MEMORY_SOURCE;
+        assert_eq!(staging_bytes(&r), 300);
     }
 
     #[test]
