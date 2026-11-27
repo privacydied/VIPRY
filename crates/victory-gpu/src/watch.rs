@@ -32,6 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, RwLock};
 
 mod ask_noreset;
+// `VICTORY_COMMIT_MEMO`.
+pub(crate) mod commit_memo;
 // Renderer port #6 (`VICTORY_PORT_GUARD`).
 mod port_guard;
 pub(crate) use port_guard::{port_guard, port_guard_line, port_guard_plan};
@@ -1731,6 +1733,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    commit_memo::changed();
     if len == 0 || !known_holes() {
         return;
     }
@@ -2716,6 +2719,11 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
+    commit_memo::uncommitted_end(block, ask_uncommitted_end)
+}
+
+/// [`uncommitted_end`], asked of the kernel.
+fn ask_uncommitted_end(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -2985,6 +2993,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// ([`views_mapped`]). What is guarded of its pages at other views is opened,
 /// and not guarded again before the change is done ([`Remapping`]).
 pub fn title_memory_splitting(at: usize, len: usize) {
+    commit_memo::changed();
     let others: Vec<usize> = elsewhere(at, len).into_iter().flat_map(|(_, others)| others).collect();
     if others.is_empty() {
         return;
@@ -3219,6 +3228,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    commit_memo::changed();
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
@@ -3229,6 +3239,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    commit_memo::changed();
     crate::texback::remapped(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = title_memory_changed(at, len);
@@ -3254,6 +3265,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    commit_memo::changed();
     crate::shadow::write_combined_freed(at, len);
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
@@ -3368,10 +3380,14 @@ pub fn use_lazy_views(materialize: fn(usize, usize) -> bool) {
 /// questions to Windows about the pages. (A fault in title memory, the
 /// title's or ours, comes to [`install`]'s handler, which asks first.)
 pub(crate) fn materialize(at: usize, len: usize) -> bool {
-    match soft() {
+    let made = match soft() {
         Some(soft) => (soft.materialize)(at, len.max(1)),
         None => LAZY_VIEWS.get().is_some_and(|f| f(at, len.max(1))),
+    };
+    if made {
+        commit_memo::changed();
     }
+    made
 }
 
 /// What the runtime gives for the views it keeps in its books alone
@@ -3447,6 +3463,7 @@ pub fn soft_view_guards() -> [u64; 2] {
 /// the view is there (as [`title_memory_remapped`] is), with the runtime's
 /// lock on its views held.
 pub fn title_memory_made_real(at: usize, len: usize) {
+    commit_memo::changed();
     if len == 0 {
         return;
     }

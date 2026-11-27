@@ -43,6 +43,8 @@ pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod fault_va;
 #[cfg(windows)]
 mod heap_marks;
 pub mod hdr;
