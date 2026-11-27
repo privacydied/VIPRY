@@ -32,7 +32,8 @@ Target: RTX 3090, Ryzen 7 3700X, 31 GB RAM, Steam with Proton Experimental.
   (about 14,000 lines), `crates/victory-gpu/src/host.rs` (about 11,500),
   `crates/victory-gpu/src/descriptor/host.rs`, `draw.rs`, `shadow.rs` and `watch.rs`
   (5,000-7,000 each). When you change one of them, put the new logic in a module of its own and
-  call it from there.
+  call it from there. A few lines in a large file to call the new module are fine.
+- Do not split a large file as part of a port. Split it in its own commit, and only when asked.
 - Moving existing code out of a large file is its own commit, with no change in behavior.
   Do not mix it with a fix or a feature.
 
