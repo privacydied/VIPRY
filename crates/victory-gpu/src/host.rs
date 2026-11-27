@@ -3961,6 +3961,7 @@ pub(crate) mod copy_split;
 mod relay_lag;
 pub(crate) mod indirects;
 mod font;
+mod flush_narrow;
 mod front_plan;
 mod lean;
 mod menu;
@@ -8028,10 +8029,14 @@ impl HostList {
                         copies += 1;
                     }
                     batch.fill();
-                    // The pages the copy will write: what a refresh kept
-                    // ahead of it keeps if they are not among them.
-                    let over = lean::title_write_range().then(|| crate::watch::written_ranges(dst, len));
-                    batch.title_written(lean::Cause::Copy, over.as_deref());
+                    if flush_narrow::on() {
+                        batch.title_written_at(lean::Cause::Copy, dst, len);
+                    } else {
+                        // The pages the copy will write: what a refresh kept
+                        // ahead of it keeps if they are not among them.
+                        let over = lean::title_write_range().then(|| crate::watch::written_ranges(dst, len));
+                        batch.title_written(lean::Cause::Copy, over.as_deref());
+                    }
                     // Into a heap's records: the rounds asked for earlier
                     // did not see it (`crate::heap_marks`).
                     if crate::heap_marks::on() && crate::descriptor::in_shader_heap(dst, len) {
@@ -8071,7 +8076,9 @@ impl HostList {
                     }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
-                    if free {
+                    if free && flush_narrow::on() {
+                        batch.title_written_at(lean::Cause::Placed, p.dst, p.len);
+                    } else if free {
                         let over = lean::title_write_range().then(|| crate::watch::written_ranges(p.dst, p.len));
                         batch.title_written(lean::Cause::Placed, over.as_deref());
                     }
@@ -9929,6 +9936,7 @@ impl Meter {
         spans::line(frames);
         crate::shadow::back_line(frames);
         submit_split_line(frames);
+        flush_narrow::line(frames);
         fresh_open_line(frames);
         crate::heap_marks::line(frames);
         #[cfg(feature = "diagnostics")]
