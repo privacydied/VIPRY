@@ -4,13 +4,18 @@ usage: vbench.py <log> [min_draws=1000] [skip_seconds=0]
 From the card clock line printed just before each frame line: queued = ms a frame the card
 had our work queued (frame ms minus the clock's idle; an upper bound of its busy time),
 behind = card idle while the submitting thread worked, untitled = card idle while the title
-had not submitted."""
+had not submitted.
+With VICTORY_MEMORY_MAP=1 the memory line gives, in MB: private = the title's private bytes,
+pcfree = the PC's free physical memory, commit = what the PC has left to commit (it falls as
+swap fills)."""
 import re, statistics as st, sys
 from datetime import datetime
 log = sys.argv[1]; mind = float(sys.argv[2]) if len(sys.argv) > 2 else 1000; skip = float(sys.argv[3]) if len(sys.argv) > 3 else 0
 ansi = re.compile(r'\x1b\[[0-9;]*m')
 pat = re.compile(r'^(\S+Z).*?([\d.]+) fps, ([\d.]+) ms/frame \(([\d.]+) preparing: copies ([\d.]+) ms [\d.]+ MB, textures ([\d.]+) ms [\d.]+ MB; ([\d.]+) on the GPU; ([\d.]+) copying back ([\d.]+) MB\), (\d+) draws/frame, dropped (\d+) without a host pipeline \((\d+) being made\)')
 clock = re.compile(r'^(\S+Z).*nothing of ours queued ([\d.]+) ms .*?, ([\d.]+) ms of that while the submitting thread was working')
+memline = re.compile(r'memory: private (\d+) MB, working set (\d+) MB; the PC: (\d+) MB free, (\d+) MB left to commit')
+mem = []
 stamp = lambda s: datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
 rows = []; t0 = None; last = None
 for line in open(log, errors='replace'):
@@ -18,6 +23,10 @@ for line in open(log, errors='replace'):
     c = clock.search(line)
     if c:
         last = (stamp(c.group(1)), float(c.group(2)), float(c.group(3)))
+        continue
+    mm = memline.search(line)
+    if mm:
+        mem.append(tuple(int(x) for x in mm.groups()))
         continue
     m = pat.search(line)
     if not m: continue
@@ -38,3 +47,7 @@ if sel:
         if not v: continue
         print(f"  {k:8s} median {st.median(v):8.1f}  p10 {v[len(v)//10]:8.1f}  p90 {v[len(v)*9//10]:8.1f}")
     worst = max(r['ms'] for r in sel); print(f"  worst 1s window {worst:.1f} ms/frame")
+if mem:
+    for k, i in [('private', 0), ('working', 1), ('pcfree', 2), ('commit', 3)]:
+        v = [m[i] for m in mem]
+        print(f"  {k:8s} first {v[0]:8d}  min {min(v):8d}  peak {max(v):8d}  last {v[-1]:8d}  MB ({len(v)} memory lines)")
