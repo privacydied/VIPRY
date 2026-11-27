@@ -2,6 +2,12 @@
 
 VIPRY is a private fork, `github.com/privacydied/VIPRY` (branch `main`). It is
 Proudnoob4/VIctory-NVIDIA `nvidia-hybrid-v2` plus our Linux/Proton work.
+`nvidia-hybrid-v2` is built on trustno1-coder/VIctory-NVIDIA
+(`github.com/trustno1-coder/VIctory-NVIDIA`, commit `033be27`). That fork is the
+NVIDIA base: it draws everything on NVIDIA, its NaN scrub fixes the black sun and
+black blobs, and it skips the broken ray-tracing passes. The avatarmanz,
+fxceless and klbf-lab work is merged on top of it. So VIPRY is also a fork of
+trustno1-coder/VIctory-NVIDIA.
 Target: RTX 3090, Ryzen 7 3700X, 31 GB RAM, Steam with Proton Experimental.
 
 ## Commit and push
