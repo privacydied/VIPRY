@@ -107,6 +107,36 @@ NVIDIA, and our first `vipry-next` run had it on), `VICTORY_CARD_STEPS=1`,
 `VICTORY_DYNAMIC_SLOTS=499999`, `VICTORY_PIPELINE_WORKERS=6`, then
 `victory warm --used` after one run with `VICTORY_PIPELINE_BOOK=1`.
 
+**Cherry-picked from Belobug** (`Belobug/VIctory-Belobug-AMD`, branch
+`a-publier`; the original authors are kept on each commit, and each message
+names its source hash)
+
+| Commit | What | Switch (off by default) |
+|---|---|---|
+| `4822935e` | One barrier per card buffer after its copies, not one per copy | none |
+| `f1e5a111`, `2a9e3b38`, `495ee3bd` | Output size and render scale | `VICTORY_OUTPUT`, `VICTORY_DISPLAY_MODE`, `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`, `VICTORY_FFX_SCALE` |
+| `bb0427d9` | Shaders: one interpolation mode per signature row | none |
+| `ce857ce5` | Shaders: a live set's registers walked a bit at a time | none |
+| `8e04404b` | Memory log by category | `VICTORY_MEMORY_CATEGORIES` |
+| `20814448` | Card and system memory segments sampled apart | none |
+| `5f05b5e6` | Trace of where pipeline workers spend time | diagnostics build only |
+| `02b398d6` | Shaders: a level query of a 2D array takes no slice (3 shaders the validator refused) | none |
+| `63b67f03` | Host sampler heaps get 2,048 slots, slot 2,047 a null sentinel | none |
+| `3510720f` | Timing runs: the card's time by kind of list | `VICTORY_GPU_TIMING` |
+| `09d548f9` | Write-watch asks leave out the kernel's reset; only found pages are reset (part of `122d3546`) | `VICTORY_ASK_NORESET` |
+
+**Not taken from Belobug**
+
+- `6d172c4` (per-heap texture pass) and `c83e54c` (ahead ranges found by
+  halving): `vipry-next` already does the same, a different way.
+- `11511b8` (texture queue without its lock, and four more changes in one
+  commit), `2f5aa98` (HUD memory labels, built on a panel we do not have),
+  `b4ba4bb` (ambient settle), `85a663d` (two planes): conflict in many places.
+- `abbbd6b`, `7348b80`, `7bf91de`, `368293e`: each needs Belobug shader
+  commits that are not in our tree.
+- `122d354`'s meter thread and `VICTORY_ASK_SPREAD`, `f36a0fc`, `8a0700a`
+  (XMA voice refill): not taken yet.
+
 **Not taken**
 
 - rota `9eb26275` (small buffers on the card) and `TEXTURE_DROP_MIPS`: they
