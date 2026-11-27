@@ -14,8 +14,9 @@
 //! - `VICTORY_SLOT_CHECK=1`: a thread walks the view heap and says which
 //!   slots name memory that is gone, while nothing is lost yet ([`check`]).
 //!
-//! The book is kept with device-removed data on (`VICTORY_D3D12_DRED`) or the
-//! check; `VICTORY_BOOK=0` keeps none.
+//! The book is kept with device-removed data on (`VICTORY_D3D12_DRED`), the
+//! check or `VICTORY_FAULT_VA` ([`crate::fault_va`]); `VICTORY_BOOK=0` keeps
+//! none.
 //!
 //! What the descriptors' bits mean is AMD's (RDNA 2 and 3); on another card
 //! nothing is decoded as an address we know, and nothing is said.
@@ -76,7 +77,7 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| {
         std::env::var_os("VICTORY_BOOK").is_none_or(|v| v != "0")
             && !cfg!(test)
-            && (crate::host::dred_any() || checks())
+            && (crate::host::dred_any() || checks() || crate::fault_va::on())
     })
 }
 
@@ -94,6 +95,7 @@ impl Book {
     fn add(&mut self, object: usize, start: u64, size: u64, what: String, now: u64) -> u64 {
         self.next += 1;
         let id = self.next;
+        crate::fault_va::told(true, &what, start, size, now);
         self.by_start.insert((start, id), ());
         if size > LONG {
             self.long.push(id);
@@ -107,6 +109,7 @@ impl Book {
 
     fn remove(&mut self, id: u64, object: usize, now: u64) {
         if let Some(entry) = self.live.remove(&id) {
+            crate::fault_va::told(false, &entry.what, entry.start, entry.size, now);
             self.by_start.remove(&(entry.start, id));
             if entry.size > LONG {
                 self.long.retain(|&l| l != id);
