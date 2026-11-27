@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Add (or update) the 'Grand Theft Auto VI' non-Steam shortcut and force Proton Experimental.
+Steam must NOT be running (it rewrites shortcuts.vdf on exit)."""
+import binascii, re, shutil, struct, sys, time
+from pathlib import Path
+
+USERDATA = Path.home() / ".steam/steam/userdata"
+CONFIG = Path.home() / ".steam/steam/config/config.vdf"
+V = Path.home() / "Games/victory"
+NAME = "Grand Theft Auto VI"
+EXE = f'"{V}/current/victory.exe"'
+START = f'"{V}/current/"'
+OPTS = f"{V}/bin/steam-launch %command%"
+TOOL = "proton_experimental"
+
+# ---- binary VDF ----
+def parse(b, i=0):
+    d = {}
+    while True:
+        t = b[i]; i += 1
+        if t == 8:
+            return d, i
+        j = b.index(0, i); k = b[i:j].decode("utf-8", "replace"); i = j + 1
+        if t == 0:
+            d[k], i = parse(b, i)
+        elif t == 1:
+            j = b.index(0, i); d[k] = b[i:j].decode("utf-8", "replace"); i = j + 1
+        elif t == 2:
+            d[k] = struct.unpack_from("<i", b, i)[0]; i += 4
+        else:
+            raise ValueError(f"vdf type {t}")
+
+def dump(d):
+    out = bytearray()
+    for k, v in d.items():
+        kb = k.encode() + b"\0"
+        if isinstance(v, dict):
+            out += b"\0" + kb + dump(v) + b"\x08"
+        elif isinstance(v, int):
+            out += b"\x02" + kb + struct.pack("<i", v)
+        else:
+            out += b"\x01" + kb + str(v).encode() + b"\0"
+    return bytes(out)
+
+def main():
+    users = [p for p in USERDATA.iterdir() if p.name.isdigit() and p.name != "0"]
+    appid_u = (binascii.crc32((EXE + NAME).encode()) & 0xFFFFFFFF) | 0x80000000
+    appid_s = struct.unpack("<i", struct.pack("<I", appid_u))[0]
+    for u in users:
+        f = u / "config/shortcuts.vdf"
+        root = {"shortcuts": {}}
+        if f.exists():
+            raw = f.read_bytes()
+            shutil.copy2(f, f.with_suffix(f".vdf.bak-{int(time.time())}"))
+            root, _ = parse(raw, 0) if raw[0] == 0 else ({"shortcuts": {}}, 0)
+        sc = root.setdefault("shortcuts", {})
+        key = next((k for k, v in sc.items() if v.get("AppName", v.get("appname")) == NAME), None)
+        if key is None:
+            key = str(max([int(k) for k in sc] + [-1]) + 1)
+        entry = sc.get(key, {})
+        entry.update({
+            "appid": appid_s, "AppName": NAME, "Exe": EXE, "StartDir": START,
+            "icon": entry.get("icon", ""), "ShortcutPath": "", "LaunchOptions": OPTS,
+            "IsHidden": 0, "AllowDesktopConfig": 1, "AllowOverlay": 1, "OpenVR": 0,
+            "Devkit": 0, "DevkitGameID": "", "DevkitOverrideAppID": 0,
+            "LastPlayTime": entry.get("LastPlayTime", 0), "FlatpakAppID": "",
+            "tags": entry.get("tags", {}),
+        })
+        sc[key] = entry
+        f.write_bytes(b"\0" + b"shortcuts\0" + dump(sc) + b"\x08\x08")
+        print(f"{f}: shortcut #{key} appid {appid_u}")
+
+    # ---- text VDF: CompatToolMapping ----
+    text = CONFIG.read_text()
+    shutil.copy2(CONFIG, CONFIG.with_suffix(f".vdf.bak-{int(time.time())}"))
+    block = re.search(r'("CompatToolMapping"\s*\n(\s*)\{\n)', text)
+    if not block:
+        sys.exit("CompatToolMapping not found in config.vdf")
+    ind = block.group(2) + "\t"
+    existing = re.search(rf'\n{re.escape(ind)}"{appid_u}"\n{re.escape(ind)}\{{.*?\n{re.escape(ind)}\}}', text, re.S)
+    entry = (f'\n{ind}"{appid_u}"\n{ind}{{\n{ind}\t"name"\t\t"{TOOL}"\n{ind}\t"config"\t\t""\n'
+             f'{ind}\t"priority"\t\t"250"\n{ind}}}')
+    if existing:
+        text = text[:existing.start()] + entry + text[existing.end():]
+    else:
+        at = block.end() - 1  # just before the newline after '{'
+        text = text[:at] + entry + text[at:]
+    CONFIG.write_text(text)
+    print(f"{CONFIG}: {appid_u} -> {TOOL}")
+
+if __name__ == "__main__":
+    main()
