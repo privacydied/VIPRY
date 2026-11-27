@@ -324,6 +324,33 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// Where a pipeline's host pipeline is, for [`super::drop_why`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Stage {
+    LeftOut,
+    NotQueued,
+    Queued,
+    Taken,
+    Refused,
+    Made,
+}
+
+pub(super) fn stage(p: &Pending) -> Stage {
+    if p.left_out.is_some() {
+        return Stage::LeftOut;
+    }
+    let p = p.usage.get().and_then(|u| u.shared.as_deref()).unwrap_or(p);
+    match p.made.get() {
+        Some(Some(_)) => Stage::Made,
+        Some(None) => Stage::Refused,
+        None => match p.queue_state.load(Ordering::Relaxed) {
+            NOT_QUEUED => Stage::NotQueued,
+            MAKING => Stage::Taken,
+            _ => Stage::Queued,
+        },
+    }
+}
+
 /// The hashes of the shaders `p` is made of.
 pub(crate) fn hashes(p: &Pending) -> String {
     let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();

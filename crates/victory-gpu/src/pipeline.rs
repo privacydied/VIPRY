@@ -917,6 +917,8 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(windows)]
+pub(crate) mod drop_why;
+#[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
 pub mod known;
