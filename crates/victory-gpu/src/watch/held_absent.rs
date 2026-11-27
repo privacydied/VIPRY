@@ -1,5 +1,5 @@
 //! Treat every uncommitted block found in a view range as a held hole
-//! (`VICTORY_HELD_ABSENT=1`, off by default).
+//! (`VICTORY_HELD_ABSENT=0` turns it off; on by default).
 //!
 //! Under `VICTORY_KNOWN_HOLES` (on by default), [`super::placeholder`] asks
 //! `NtQueryVirtualMemory(MemoryRegionInformationEx = 7)` whether an
@@ -18,14 +18,14 @@
 
 use std::sync::OnceLock;
 
-/// Whether `VICTORY_HELD_ABSENT=1` is enabled.
+/// Whether `VICTORY_HELD_ABSENT` is enabled (`=0` turns it off).
 pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| parse(std::env::var("VICTORY_HELD_ABSENT").ok().as_deref()))
 }
 
 fn parse(val: Option<&str>) -> bool {
-    matches!(val, Some("1"))
+    !matches!(val, Some("0"))
 }
 
 #[cfg(test)]
@@ -33,9 +33,9 @@ mod tests {
     use super::parse;
 
     #[test]
-    fn default_off_and_explicit_on() {
-        assert!(!parse(None));
-        assert!(!parse(Some("0")));
+    fn default_on_and_explicit_off() {
+        assert!(parse(None));
         assert!(parse(Some("1")));
+        assert!(!parse(Some("0")));
     }
 }
