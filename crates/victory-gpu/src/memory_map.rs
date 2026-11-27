@@ -235,6 +235,19 @@ pub(crate) fn line() {
     if let Some(h) = crate::host::host() {
         h.log_video_memory("with the memory line");
     }
+    // Host lists: each is a command allocator and a list with the driver's
+    // command memory behind them (0.68 MB of private memory each on the old
+    // base, more once a big recording has grown its allocator).
+    let lists = &crate::host::LISTS;
+    let (idle, idle_bytes) = crate::list::idle_now();
+    tracing::info!(
+        "memory: host lists made {}, preludes made {}, never reset {}; idle {} keeping {} MB of upload memory",
+        lists[0].load(Relaxed),
+        lists[1].load(Relaxed),
+        lists[3].load(Relaxed),
+        idle,
+        idle_bytes >> 20
+    );
     if half_minutes % 2 == 0 && !WALKING.swap(true, Relaxed) {
         let walk = std::thread::Builder::new().name("victory-memory-map".into()).spawn(|| {
             log();
