@@ -783,7 +783,13 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
         // SAFETY: a buffer of the size the library asks for.
         return unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed);
     }
-    let mut bytes = vec![0u8; size];
+    // Reserved fallibly: the library is about 1.7 GB on NVIDIA, and an
+    // infallible allocation of that size aborted the process upstream.
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(size).is_err() {
+        return Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, format!("no memory for {size} bytes")));
+    }
+    bytes.resize(size, 0);
     // SAFETY: a buffer of the size the library asks for.
     unsafe { library.Serialize(&mut bytes) }.map_err(failed)?;
     std::fs::write(tmp, &bytes)
