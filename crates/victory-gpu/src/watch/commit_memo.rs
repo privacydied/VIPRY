@@ -28,16 +28,33 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
+
+/// Mode of `VICTORY_COMMIT_MEMO`: off, per-frame (`=1`), or across frames
+/// until a told memory change touches the run (`=forever` / `=2`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Off,
+    Frame,
+    Forever,
+}
+
+fn mode() -> Mode {
+    static MODE: OnceLock<Mode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_COMMIT_MEMO").ok().as_deref() {
+        Some("1") => Mode::Frame,
+        Some("2" | "forever") => Mode::Forever,
+        _ => Mode::Off,
+    })
+}
 
 /// Whether the switch is on.
 pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_COMMIT_MEMO"))
+    mode() != Mode::Off
 }
 
 struct Runs {
-    /// The frame the runs were named in.
+    /// The frame the runs were named in (ignored in [`Mode::Forever`]).
     frame: u64,
     /// Moved by every told change: a question asked across one is not kept.
     generation: u64,
@@ -46,7 +63,7 @@ struct Runs {
     runs: BTreeMap<usize, usize>,
 }
 
-static RUNS: Mutex<Runs> = Mutex::new(Runs {
+static RUNS: RwLock<Runs> = RwLock::new(Runs {
     frame: u64::MAX,
     generation: 0,
     runs: BTreeMap::new(),
@@ -55,8 +72,12 @@ static RUNS: Mutex<Runs> = Mutex::new(Runs {
 static KEPT: AtomicU64 = AtomicU64::new(0);
 static ASKED: AtomicU64 = AtomicU64::new(0);
 
-fn runs() -> std::sync::MutexGuard<'static, Runs> {
-    RUNS.lock().unwrap_or_else(|e| e.into_inner())
+fn runs_read() -> std::sync::RwLockReadGuard<'static, Runs> {
+    RUNS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn runs_write() -> std::sync::RwLockWriteGuard<'static, Runs> {
+    RUNS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The runtime told of a change to title memory at `[at, at + len)`: the
@@ -69,7 +90,7 @@ pub(crate) fn changed(at: usize, len: usize) {
         at / super::BLOCK,
         at.saturating_add(len.max(1)).div_ceil(super::BLOCK),
     );
-    forget(&mut runs(), first, last);
+    forget(&mut runs_write(), first, last);
 }
 
 /// The runs touching blocks `[first, last)` are let go of.
@@ -88,34 +109,49 @@ fn forget(r: &mut Runs, first: usize, last: usize) {
 
 /// [`super::uncommitted_end`] of `block`, `ask` being the kernel's answer.
 pub(super) fn uncommitted_end(block: usize, ask: impl FnOnce(usize) -> usize) -> usize {
-    if !on() {
+    let m = mode();
+    if m == Mode::Off {
         return ask(block);
     }
     line();
-    memo(block, crate::frame::current(), ask)
+    let frame = if m == Mode::Forever { 0 } else { crate::frame::current() };
+    memo(block, frame, ask)
 }
 
-/// [`uncommitted_end`] with the switch on, in frame `frame`.
+/// [`uncommitted_end`] with the switch on, in frame `frame` (pass a constant
+/// frame for cross-frame retention).
 fn memo(block: usize, frame: u64, ask: impl FnOnce(usize) -> usize) -> usize {
     let generation = {
-        let mut r = runs();
-        if r.frame != frame {
-            r.frame = frame;
-            r.runs.clear();
+        let r = runs_read();
+        if r.frame == frame {
+            if let Some((_, &end)) = r.runs.range(..=block).next_back()
+                && block < end
+            {
+                KEPT.fetch_add(1, Ordering::Relaxed);
+                return end;
+            }
+            r.generation
+        } else {
+            drop(r);
+            let mut w = runs_write();
+            if w.frame != frame {
+                w.frame = frame;
+                w.runs.clear();
+            }
+            if let Some((_, &end)) = w.runs.range(..=block).next_back()
+                && block < end
+            {
+                KEPT.fetch_add(1, Ordering::Relaxed);
+                return end;
+            }
+            w.generation
         }
-        if let Some((_, &end)) = r.runs.range(..=block).next_back()
-            && block < end
-        {
-            KEPT.fetch_add(1, Ordering::Relaxed);
-            return end;
-        }
-        r.generation
     };
     // (Asked with the lock not held: the kernel's answer takes its own.)
     let end = ask(block);
     ASKED.fetch_add(1, Ordering::Relaxed);
     if end > block {
-        let mut r = runs();
+        let mut r = runs_write();
         if r.generation == generation && r.frame == frame {
             // The runs inside this one were named before it grew.
             let inside: Vec<usize> = r
@@ -191,24 +227,24 @@ mod tests {
         assert_eq!(memo(35, 1, ask), 40);
         assert_eq!(asked.get(), 5);
         // A change touching the second run: only it is asked again.
-        forget(&mut runs(), 39, 40);
+        forget(&mut runs_write(), 39, 40);
         assert_eq!(memo(12, 1, ask), 20);
         assert_eq!(asked.get(), 5);
         assert_eq!(memo(31, 1, ask), 40);
         assert_eq!(asked.get(), 6);
         // A change just past a run's end leaves it.
-        forget(&mut runs(), 20, 25);
+        forget(&mut runs_write(), 20, 25);
         assert_eq!(memo(19, 1, ask), 20);
         assert_eq!(asked.get(), 6);
         // The next frame asks again.
         assert_eq!(memo(15, 2, ask), 20);
         assert_eq!(asked.get(), 7);
         // A run named from its middle, then from before it: one run.
-        forget(&mut runs(), 0, 100);
+        forget(&mut runs_write(), 0, 100);
         assert_eq!(memo(15, 2, ask), 20);
         assert_eq!(memo(12, 2, ask), 20);
         assert_eq!(
-            runs()
+            runs_read()
                 .runs
                 .iter()
                 .map(|(&a, &b)| (a, b))
@@ -217,10 +253,10 @@ mod tests {
         );
         // A change told while a question was out: its answer is not kept.
         let ask_changing = |b: usize| {
-            forget(&mut runs(), 0, 1);
+            forget(&mut runs_write(), 0, 1);
             ask(b)
         };
         assert_eq!(memo(30, 2, ask_changing), 40);
-        assert!(runs().runs.range(30..31).next().is_none());
+        assert!(runs_read().runs.range(30..31).next().is_none());
     }
 }
