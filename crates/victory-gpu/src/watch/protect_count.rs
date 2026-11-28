@@ -1,15 +1,35 @@
 //! Our changes of protection of title memory, counted by who makes them and
-//! how many blocks each takes (diagnostics builds).
+//! how many blocks each takes (diagnostics builds), and made fewer
+//! (`VICTORY_PROTECT_MERGE=1`, off by default; flippable with `VICTORY_AB`).
 //!
 //! Under Wine every change of protection, every write fault, every asking of
 //! the write watch and the runtime's mapping of physical pages take one lock
 //! of the whole process (ntdll's `virtual_mutex`): 11-18 ms a frame of
 //! `VirtualProtect` on the present chain (timeline L3-tl-plain). Which of
 //! ours they are, and how many fail, says what to cut.
+//!
+//! With the switch:
+//! - a run of blocks to make read-only is cut where the title's views meet
+//!   ([`crate::inplace::view_pieces`]), one call each piece. A call over two
+//!   views fails (the host takes a range within one mapping only), and the
+//!   whole run was then done block by block: one failed call and one a block.
+//! - blocks given write access back together (a fault through a page shown
+//!   at several views, a view mapped anew, our own writes) are one call for
+//!   each run of neighbours within one view, not one a block.
+//!
+//! Each piece and run is all title view memory of one mapping, which the
+//! guards made read-only: the protection found at its first block (`old`)
+//! is checked as before, and a call that fails is done block by block, as
+//! before. The switch only groups the calls, so it may change while the
+//! title runs.
 
 use super::BLOCK;
 #[cfg(feature = "diagnostics")]
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+pub(super) fn on() -> bool {
+    crate::asked_for!("VICTORY_PROTECT_MERGE")
+}
 
 /// Who changes a protection.
 #[derive(Clone, Copy)]
@@ -96,6 +116,40 @@ pub(super) fn set(by: By, from: usize, to: usize, new: u32) -> (bool, u32) {
     (done, old)
 }
 
+/// `blocks` (sorted, no repeats) cut in runs of neighbours within one of
+/// the title's views; a block in no view is a run of its own.
+pub(super) fn runs_in_views(blocks: &[usize]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < blocks.len() {
+        let first = blocks[i];
+        let mut last = first + 1;
+        let mut j = i + 1;
+        while j < blocks.len() && blocks[j] == last {
+            last += 1;
+            j += 1;
+        }
+        // A run of neighbours: cut where views meet.
+        let pieces = crate::inplace::view_pieces(first * BLOCK, (last - first) * BLOCK);
+        let mut at = first;
+        for (start, len) in pieces {
+            let (a, b) = (start / BLOCK, (start + len) / BLOCK);
+            for block in at..a.min(last) {
+                out.push((block, block + 1));
+            }
+            if a < b {
+                out.push((a, b));
+            }
+            at = b.max(at);
+        }
+        for block in at..last {
+            out.push((block, block + 1));
+        }
+        i = j;
+    }
+    out
+}
+
 /// Logs and clears the counts, per frame; diagnostics builds.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn line(frames: f64) {
@@ -124,7 +178,8 @@ pub(crate) fn line(frames: f64) {
     }
     tracing::info!(
         target: "victory_gpu::host",
-        "our changes of protection per frame: {:.0} calls, {:.0} failed, {:.0} blocks, {:.2} ms; {}",
+        "our changes of protection per frame{}: {:.0} calls, {:.0} failed, {:.0} blocks, {:.2} ms; {}",
+        if on() { " (VICTORY_PROTECT_MERGE=1)" } else { "" },
         total[0] / f,
         total[1] / f,
         total[2] / f,
@@ -135,3 +190,27 @@ pub(crate) fn line(frames: f64) {
 
 #[cfg(not(feature = "diagnostics"))]
 pub(crate) fn line(_: f64) {}
+
+#[cfg(test)]
+mod tests {
+    use super::{BLOCK, runs_in_views};
+
+    #[test]
+    fn runs_are_cut_where_views_meet() {
+        // Two views side by side of blocks 0-2 and 3-4 of a made-up place
+        // far from anything mapped; block 7 in none.
+        let base = 0x7e00_0000_0000usize;
+        let b0 = base / BLOCK;
+        crate::inplace::title_memory_view(base, 3 * BLOCK, 0xdead_0001, 0);
+        crate::inplace::title_memory_view(base + 3 * BLOCK, 2 * BLOCK, 0xdead_0002, 0);
+        let blocks: Vec<usize> = [0, 1, 2, 3, 4, 7].iter().map(|b| b0 + b).collect();
+        let runs = runs_in_views(&blocks);
+        crate::inplace::views_gone(base, 8 * BLOCK);
+        assert_eq!(runs, vec![(b0, b0 + 3), (b0 + 3, b0 + 5), (b0 + 7, b0 + 8)]);
+        // A gap inside one view: two runs.
+        crate::inplace::title_memory_view(base, 4 * BLOCK, 0xdead_0003, 0);
+        let runs = runs_in_views(&[b0, b0 + 2, b0 + 3]);
+        crate::inplace::views_gone(base, 4 * BLOCK);
+        assert_eq!(runs, vec![(b0, b0 + 1), (b0 + 2, b0 + 4)]);
+    }
+}

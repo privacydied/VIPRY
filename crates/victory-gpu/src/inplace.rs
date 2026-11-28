@@ -477,6 +477,23 @@ pub(crate) fn shown_bytes(at: usize, len: usize) -> Option<u64> {
     any.then_some(there)
 }
 
+/// What of `[at, at + len)` views of physical pages show, in order, a piece
+/// for each view: (address, bytes). A change of protection is within one
+/// mapping (`crate::watch`, `VICTORY_PROTECT_MERGE`).
+pub(crate) fn view_pieces(at: usize, len: usize) -> Vec<(usize, usize)> {
+    let end = at.saturating_add(len);
+    let v = views();
+    let first = v.views.range(..=at).next_back();
+    let rest = v.views.range(at.saturating_add(1)..end.max(at.saturating_add(1)));
+    first
+        .into_iter()
+        .chain(rest)
+        .map(|(&base, view)| (base.max(at), base.saturating_add(view.0).min(end)))
+        .filter(|&(from, to)| from < to)
+        .map(|(from, to)| (from, to - from))
+        .collect()
+}
+
 /// What of `[at, at + len)` views of physical pages show, in order, pieces
 /// that touch as one: (address, bytes). Empty: nothing, or memory of another
 /// kind.

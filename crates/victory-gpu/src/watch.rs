@@ -2731,12 +2731,31 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
     // ([`title_memory_made_real`]).
     let soft = soft_runs(from * BLOCK, (to - from) * BLOCK);
     let in_books = |block: usize| soft.iter().any(|&(at, n)| at <= block * BLOCK && (block + 1) * BLOCK <= at + n);
-    if soft.is_empty() && set(from, to) {
+    // The blocks left to do one by one.
+    let mut left: Vec<usize> = Vec::new();
+    // (`VICTORY_PROTECT_MERGE`: a run over several views is a call a view,
+    // not a failed call for the run and one a block.)
+    let pieces = if soft.is_empty() && protect_count::on() && to - from > 1 {
+        protect_count::runs_in_views(&(from..to).collect::<Vec<_>>())
+    } else {
+        Vec::new()
+    };
+    if pieces.len() > 1 {
+        for (a, b) in pieces {
+            if b - a > 1 && set(a, b) {
+                note(g, a, b);
+            } else {
+                left.extend(a..b);
+            }
+        }
+    } else if soft.is_empty() && set(from, to) {
         note(g, from, to);
         return;
+    } else {
+        left.extend(from..to);
     }
     let mut uncommitted_until = from;
-    for block in from..to {
+    for block in left {
         if in_books(block) {
             note(g, block, block + 1);
             SOFT_GUARDS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2843,14 +2862,31 @@ fn unguard(g: &Guards, blocks: &[usize]) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
     }
-    for &block in blocks {
-        let (done, old) = protect_count::set(By::Open, block, block + 1, PAGE_READWRITE);
+    // (`VICTORY_PROTECT_MERGE`: a call for each run of neighbours within
+    // one view; one that fails, block by block.)
+    let runs: Vec<(usize, usize)> = if protect_count::on() && blocks.len() > 1 {
+        let mut sorted = blocks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        protect_count::runs_in_views(&sorted)
+    } else {
+        blocks.iter().map(|&block| (block, block + 1)).collect()
+    };
+    for (from, to) in runs {
+        let (done, old) = protect_count::set(By::Open, from, to, PAGE_READWRITE);
         if done && !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
             // Not what we left there: the address is other memory's
             // (code's, say), which keeps its protection.
-            protect_count::set(By::Open, block, block + 1, old);
+            protect_count::set(By::Open, from, to, old);
+        } else if !done && to - from > 1 {
+            for block in from..to {
+                let (done, old) = protect_count::set(By::Open, block, block + 1, PAGE_READWRITE);
+                if done && !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+                    protect_count::set(By::Open, block, block + 1, old);
+                }
+            }
         }
-        PROTECTED.clear(block);
+        (from..to).for_each(|block| PROTECTED.clear(block));
     }
     #[cfg(feature = "diagnostics")]
     if !blocks.is_empty() {
