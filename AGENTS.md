@@ -12,12 +12,16 @@ Target: RTX 3090, Ryzen 7 3700X, 31 GB RAM, Steam with Proton Experimental.
 
 ## Rules for content
 
+The repository is private. The owner lifted the content rules about the game:
+- Game shader names, game logs, screenshots and the title's name may go in code,
+  comments, commits and docs.
 
-- Do not name games, publishers or their staff in code, comments, commits or pull
-  requests. Say "the title".
+These rules stay:
 - Do not loosen `crates/victory-hle/src/modules/net.rs`: the title may only reach
   loopback.
-- No GPL-2.0-only code. Nothing from repositories without a licence.
+- No GPL-2.0-only code. Nothing from repositories without a licence. Check each
+  fork's LICENSE before copying from it. If a fork has no licence, reimplement
+  from your own reading of what it does and write "reimplemented" in the commit.
 - Write commits in English. No AI attribution lines in commits. A pull request
   body ends with `AI-assisted`.
 
