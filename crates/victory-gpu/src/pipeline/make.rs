@@ -75,16 +75,43 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 /// The hashes are those of the title's own containers, and a pipeline made
 /// from pieces (`VICTORY_PIPELINE_PIECES=1`) is left out when the title's
 /// container of the same program is named (`Shader::is`).
+///
+/// `VICTORY_LEAVE_OUT_FILE=<path>[;<path>..]`: more hashes, any run of 16 hex
+/// digits in the files (the RT lists in `scripts/`, 1,077 hashes, too long
+/// for one variable). From fxceless f9e0371a6 (`VICTORY_DENY_PIPELINES_FILE`).
 fn leave_out() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     HASHES.get_or_init(|| {
-        std::env::var("VICTORY_LEAVE_OUT")
+        let files: String = std::env::var("VICTORY_LEAVE_OUT_FILE")
             .unwrap_or_default()
-            .split(',')
-            .map(|h| h.trim().to_ascii_lowercase())
-            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-            .collect()
+            .split(';')
+            .filter(|p| !p.trim().is_empty())
+            .filter_map(|p| match std::fs::read_to_string(p.trim()) {
+                Ok(text) => Some(text),
+                Err(e) => {
+                    tracing::warn!(path = p, error = %e, "VICTORY_LEAVE_OUT_FILE: not read");
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut hashes = hex_hashes(&std::env::var("VICTORY_LEAVE_OUT").unwrap_or_default());
+        hashes.extend(hex_hashes(&files));
+        hashes.sort();
+        hashes.dedup();
+        if !hashes.is_empty() {
+            tracing::info!(pipelines = hashes.len(), "shader hashes left out (VICTORY_LEAVE_OUT / _FILE)");
+        }
+        hashes
     })
+}
+
+/// Every run of exactly 16 hex digits in `text`, lower case.
+fn hex_hashes(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_hexdigit())
+        .filter(|h| h.len() == 16)
+        .map(|h| h.to_ascii_lowercase())
+        .collect()
 }
 
 /// The light in the water's volume, in tiles (`water_shading:CS_TransmissionVolumetrics_Tiled`
@@ -1290,5 +1317,15 @@ mod tests {
         assert!(refused.made.set(None).is_ok());
         assert!(refused.standin().is_none());
         assert!(Pending::new(vec![shader], None).compatibility().is_none());
+    }
+
+    #[test]
+    fn left_out_hashes_are_runs_of_sixteen_hex_digits() {
+        let text = "002F8EB4802DEB36,008f3e09ac72b1e0\n009411de14bdaf7c x 0123 0123456789abcdef0";
+        assert_eq!(
+            super::hex_hashes(text),
+            ["002f8eb4802deb36", "008f3e09ac72b1e0", "009411de14bdaf7c"]
+        );
+        assert!(super::hex_hashes("").is_empty());
     }
 }
