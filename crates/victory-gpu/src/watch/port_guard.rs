@@ -352,12 +352,8 @@ pub(super) fn forget_views(first: usize, last: usize) {
 }
 
 
-/// Whether a guard's first looks (a view? all clean?) are made under the
-/// shared lock: with the switch, and none of what faults opened without the
-/// lock waits to be settled ([`settle`] is done by who holds it alone).
-pub(super) fn shared_looks() -> bool {
-    port_guard() && TO_SETTLE.load(std::sync::atomic::Ordering::SeqCst) == 0
-}
+// (Whether a guard's first looks are made under the shared lock: with the
+// switch, or `VICTORY_SHARED_LOOKS`, in `super::shared_looks`.)
 
 /// With renderer port #6: whether a submission's look at which refreshes
 /// copy nothing (`Shadow::nothing_new`, before the threads are woken for the

@@ -37,9 +37,11 @@ pub(crate) mod commit_memo;
 mod held_absent;
 // Renderer port #6 (`VICTORY_PORT_GUARD`).
 mod port_guard;
+// `VICTORY_SHARED_LOOKS`.
+mod shared_looks;
 pub(crate) use port_guard::{port_guard, port_guard_line, port_guard_plan};
 use port_guard::{
-    Claims, P6_NOT_ASKED, VIEWS, forget_views, guard_shared, known_views, open_faulted, port6_count, refused_as_view, shared_looks,
+    Claims, P6_NOT_ASKED, VIEWS, forget_views, guard_shared, known_views, open_faulted, port6_count, refused_as_view,
 };
 #[cfg(test)]
 use port_guard::{P6_FAULTS, P6_GUARDS, PORT6, PORT_GUARD_IN_TEST};
@@ -1659,7 +1661,8 @@ fn publish(pages: &[usize]) {
         }
         return;
     }
-    let g = guards();
+    let g = if shared_looks::now() { shared_looks::Held::Shared(guards_shared()) } else { shared_looks::Held::Alone(guards()) };
+    let g: &Guards = &g;
     for &page in pages {
         if (g.clean.contains(page) || g.held.contains(page)) && !unsettled(page, page + 1) {
             PUBLISHED.set(page);
@@ -2347,7 +2350,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         && (PROTECTED.any(first, first + 1) || {
             // (Renderer port #6: shared, a look only.)
             let of = |g: &Guards| g.protected.contains(first) || g.absent.contains(first);
-            if shared_looks() { of(&guards_timed_shared()) } else { of(&guards_timed()) }
+            if shared_looks::now() { of(&guards_timed_shared()) } else { of(&guards_timed()) }
         });
     if !known && !is_view(start, end) {
         return None;
@@ -2366,7 +2369,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         };
         // (Renderer port #6: shared, a look only. A block a fault opens
         // meanwhile was clean, read-only and unwritten when looked at.)
-        let unsure = if shared_looks() { of(&guards_timed_shared()) } else { of(&guards_timed()) };
+        let unsure = if shared_looks::now() { of(&guards_timed_shared()) } else { of(&guards_timed()) };
         match unsure {
             Some(unsure) => unsure,
             None => {
