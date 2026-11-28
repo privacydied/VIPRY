@@ -148,9 +148,12 @@ fn with<T>(f: impl FnOnce(&mut State) -> T) -> T {
 /// A failure our D3D12 or DXGI answered, for the ring (any build; it does
 /// nothing while the switch is off).
 pub fn note_failure(object: &'static str, slot: usize, hr: i32) {
-    if !on() {
-        return;
+    if on() {
+        note_failure_always(object, slot, hr);
     }
+}
+
+fn note_failure_always(object: &'static str, slot: usize, hr: i32) {
     with(|s| {
         s.push(Entry {
             what: What::Failure(object, slot, hr),
@@ -164,7 +167,12 @@ pub fn note_failure(object: &'static str, slot: usize, hr: i32) {
 extern "C" fn enter(site: &'static Site, frame: *mut u64) {
     // SAFETY: `frame` points at the words `hle_last_enter` pushed, followed
     // by the return address the caller's `call` pushed.
-    let (args, slot) = unsafe { ([*frame.add(4), *frame.add(3), *frame.add(2), *frame.add(1)], frame.add(5)) };
+    let (args, slot) = unsafe {
+        (
+            [*frame.add(4), *frame.add(3), *frame.add(2), *frame.add(1)],
+            frame.add(5),
+        )
+    };
     // SAFETY: as above.
     let from = unsafe { *slot };
     with(|s| {
@@ -290,10 +298,19 @@ pub(crate) fn wrap(dll: &str, symbol: &str, address: usize) -> usize {
     if stubs.0 + STUB > stubs.1 {
         // SAFETY: a fresh anonymous allocation.
         let base = unsafe {
-            VirtualAlloc(std::ptr::null(), CHUNK, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+            VirtualAlloc(
+                std::ptr::null(),
+                CHUNK,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
         } as usize;
         if base == 0 {
-            tracing::warn!(dll, symbol, "VICTORY_HLE_LAST: no memory for a stub; the import is not noted");
+            tracing::warn!(
+                dll,
+                symbol,
+                "VICTORY_HLE_LAST: no memory for a stub; the import is not noted"
+            );
             return address;
         }
         *stubs = (base, base + CHUNK);
@@ -319,6 +336,10 @@ pub(crate) fn lines() -> Vec<String> {
     if !on() {
         return Vec::new();
     }
+    ring_lines()
+}
+
+fn ring_lines() -> Vec<String> {
     let (ring, count) = with(|s| (s.ring, s.count));
     let mut out = vec![format!(
         "  our last calls on this thread (VICTORY_HLE_LAST), {} of {count}, oldest first:",
@@ -355,4 +376,75 @@ pub(crate) fn lines() -> Vec<String> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Six integer and two floating arguments: four in registers, the rest
+    /// on the stack, where the stub must leave them.
+    extern "system" fn probe(
+        a: u64,
+        b: f64,
+        c: u64,
+        d: f32,
+        e: u64,
+        f: f64,
+        g: u64,
+        h: u64,
+    ) -> f64 {
+        (a + c + e + g + h) as f64 + b + f64::from(d) + f
+    }
+
+    extern "system" fn sum(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> u64 {
+        a + b * 10 + c * 100 + d * 1000 + e * 10_000 + f * 100_000
+    }
+
+    /// Calls `inner` through its stub, from inside a wrapped call.
+    extern "system" fn outer(inner: u64, x: u64) -> u64 {
+        // SAFETY: `inner` is the stub of `sum`.
+        let inner: extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+            unsafe { std::mem::transmute(inner) };
+        inner(x, 2, 3, 4, 5, 6) + 1
+    }
+
+    #[test]
+    fn calls_through_a_stub_keep_arguments_and_results_and_are_noted() {
+        type Probe = extern "system" fn(u64, f64, u64, f32, u64, f64, u64, u64) -> f64;
+        type Sum = extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64;
+        type Outer = extern "system" fn(u64, u64) -> u64;
+        // SAFETY: each stub jumps on to the function it was made for.
+        let (p, s, o): (Probe, Sum, Outer) = unsafe {
+            (
+                std::mem::transmute(wrap("t.dll", "probe", probe as *const () as usize)),
+                std::mem::transmute(wrap("t.dll", "sum", sum as *const () as usize)),
+                std::mem::transmute(wrap("t.dll", "outer", outer as *const () as usize)),
+            )
+        };
+        assert_eq!(p(1, 0.5, 2, 0.25, 3, 0.125, 4, 5), 15.875);
+        assert_eq!(s(1, 2, 3, 4, 5, 6), 654_321);
+        assert_eq!(o(s as *const () as u64, 7), 654_328);
+        note_failure_always("pipeline state", 0x58, 0x8000_4001_u32 as i32);
+        let text = ring_lines().join("\n");
+        assert!(
+            text.contains("t.dll!sum(0x1, 0x2, 0x3, 0x4) -> 0x9fbf1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("t.dll!sum(0x7, 0x2, 0x3, 0x4) -> 0x9fbf7"),
+            "{text}"
+        );
+        assert!(text.contains("t.dll!outer("), "{text}");
+        assert!(text.contains("-> 0x9fbf8"), "{text}");
+        assert!(
+            text.contains("pipeline state, slot 0x58, answered 0x80004001"),
+            "{text}"
+        );
+        assert_eq!(
+            with(|s| s.depth),
+            0,
+            "every return was caught and given back"
+        );
+    }
 }
