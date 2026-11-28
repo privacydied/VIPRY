@@ -32,6 +32,7 @@ mod card_marks;
 // The title's bytes under flights' writes, compared and put in in one pass.
 mod small_bar;
 mod take_batch;
+mod shared_lookups;
 pub(crate) mod under_fused;
 use under_fused::{Compared, UNDER_NS, under_fused, under_ns};
 
@@ -6323,6 +6324,12 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         if let Some(shadow) = map.get(&named) {
             note(shadow);
             return Some(shadow.clone());
+        }
+    } else if shared_lookups::on() {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = shared_lookups::find(&map, cell, address, end, unsized_ask, named) {
+            note(&shadow);
+            return Some(shadow);
         }
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
