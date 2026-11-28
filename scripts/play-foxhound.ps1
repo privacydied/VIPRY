@@ -112,9 +112,7 @@ $settings = @{
     VICTORY_BUDGET_PACK = '1'
 }
 if ($Fast) {
-    # Host pipelines: no wait that cannot end in the frame, none while a backlog is queued, extra threads for the
-    # slow ones while nothing is asked
-    $settings.VICTORY_PIPELINE_WAIT_ONCE = '1'; $settings.VICTORY_PIPELINE_WAIT_BACKLOG = '64'
+    # Host pipelines: extra threads for the slow ones while nothing is asked
     $settings.VICTORY_PIPELINE_SLOW_WORKERS = '8'
     # Textures and staging
     $settings.VICTORY_TEXTURE_LOOK_ONCE = '1'; $settings.VICTORY_TEXTURE_READ_AHEAD = '1'; $settings.VICTORY_STAGING_NO_ZERO = '1'
