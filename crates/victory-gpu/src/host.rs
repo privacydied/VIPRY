@@ -4322,6 +4322,8 @@ pub(crate) mod indirects;
 mod font;
 mod flush_narrow;
 mod front_plan;
+// `VICTORY_FRONT_WAIT`.
+mod front_wait;
 mod lean;
 mod menu;
 mod pacing;
@@ -8742,6 +8744,7 @@ fn submit_split_line(frames: f64) {
         ms[15],
     );
     lean::line(frames);
+    front_wait::line(frames);
     crate::shadow::refresh_split_line(frames);
     lean::walks_line(frames);
     sets::line(frames);
@@ -9544,19 +9547,24 @@ impl Batch {
         // VICTORY_REFRESH_PROBE_TEXTURES): tried here first ([`lean::spread`]).
         // taken before the closure moves `due`.
         let small = !many && (due.is_empty() || lean::textures_small(&due, spans.len()));
-        lean::spread(spans.len() + due.len(), small, move |i| {
+        let probe = front_wait::begin();
+        let ended = probe.clone();
+        let textures = due.len();
+        lean::spread(spans.len() + due.len(), small, front_wait::wrap(probe, textures, move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();
-                return;
+                return true;
             };
             let (shadow, from, to) = &spans[i];
             if many && lean::polled(lean::Poll::Front, shadow, *from, *to - *from) {
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
+                return false;
             }
             Self::update(shadow, *from, *to);
-        });
+            true
+        }));
+        front_wait::end(ended);
         if ahead {
             crate::watch::ask_ahead_done();
         }
