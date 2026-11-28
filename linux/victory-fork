@@ -9,7 +9,7 @@
 #   victory-fork build <name>              build the fork for Windows (cargo-xwin) into builds/<name>
 #   victory-fork use <name>                make <name> the one Steam starts
 #   victory-fork get <name> [ref]          update + build + use, in one step
-#   victory-fork run [name] [seconds]     start it outside Steam (same Proton + prefix), log in logs/
+#   victory-fork run [name] [seconds]     start it outside Steam (same Proton + prefix, VICTORY_PROTON_FILES=<proton>/files for another), log in logs/
 #   victory-fork env <name>                open the fork's switch file in $EDITOR
 #   victory-fork remove <name>             forget a fork (keeps its cache)
 #
@@ -207,7 +207,7 @@ cmd_use() {
 cmd_run() {
     local fork="${1:-$(current)}" secs="${2:-0}"
     need_name "$fork"
-    local PF="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/files"
+    local PF="${VICTORY_PROTON_FILES:-$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/files}"
     local appid; appid="$(cat "$V/.steam-appid" 2>/dev/null)"
     export WINEPREFIX="$HOME/.local/share/Steam/steamapps/compatdata/$appid/pfx"
     [[ -d "$WINEPREFIX" ]] || die "no Proton prefix yet; start the game from Steam once"
