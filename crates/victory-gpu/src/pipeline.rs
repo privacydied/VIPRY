@@ -1078,6 +1078,8 @@ mod library;
 #[cfg(windows)]
 mod make;
 #[cfg(windows)]
+mod overflow_room;
+#[cfg(windows)]
 mod spare;
 #[cfg(windows)]
 mod wait_each;

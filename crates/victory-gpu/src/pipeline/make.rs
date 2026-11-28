@@ -883,6 +883,7 @@ fn workers() -> bool {
         let extras = if running { slow_extras(workers + screens, std::thread::available_parallelism().map_or(2, |n| n.get())) } else { 0 };
         for i in 0..extras {
             let spawned = std::thread::Builder::new().name(format!("victory-pipelines-slow-{i}")).spawn(|| {
+                super::overflow_room::keep();
                 let lowest = std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
                 // SAFETY: a plain call on our own thread.
                 unsafe {
@@ -927,6 +928,7 @@ pub(super) fn spawn_worker(name: String, screens_only: bool) -> bool {
         builder = builder.stack_size(bytes);
     }
     let spawned = builder.spawn(move || {
+        super::overflow_room::keep();
         // Below the title's own threads (loading, recording),
         // and the streaming one, which is below normal itself
         // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
