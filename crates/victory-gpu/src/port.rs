@@ -78,6 +78,22 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// Whether indirect executions whose arguments or count lie in memory in
+/// place here are clamped alone, right before they run
+/// (`VICTORY_PORT_CONSTANTS_ORDER`, on with the port; `=0`: in batches and
+/// windows as any other).
+///
+/// A batch or a window clamps records ahead, in the pass recorded where it
+/// was opened, before the commands between it and the execution that reads
+/// the record. For a host copy that is fine: its bytes are the title's of
+/// the submission. In place, the records the title's culling passes write
+/// between the two are read before they are written: the execution draws
+/// the records of an earlier frame, or none (objects missing for runs of
+/// frames while the camera moves).
+pub(crate) fn order_alone() -> bool {
+    on() && crate::toggled!("VICTORY_PORT_CONSTANTS_ORDER")
+}
+
 /// A stretch of title memory opened as a heap through a view of ours.
 struct Region {
     start: u64,

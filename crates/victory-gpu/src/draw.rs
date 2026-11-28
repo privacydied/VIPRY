@@ -5629,8 +5629,15 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
             return true;
         }
+        // Renderer port 1: arguments (or their count) in place are clamped
+        // alone, right before their execution (`crate::port::order_alone`).
+        let alone = crate::port::order_alone() && (args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place()));
+        if alone {
+            self.batch = None;
+            self.window = None;
+        }
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -5646,6 +5653,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
+            && !alone
             && kind != DISPATCH
             && max == 1
             && count.is_none()
