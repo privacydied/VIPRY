@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, RwLock};
 
 mod ask_noreset;
+mod ask_ranges;
 // `VICTORY_COMMIT_MEMO`.
 pub(crate) mod read_journal;
 pub(crate) mod writer_census;
@@ -389,7 +390,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if journal().kept {
         return;
     }
-    let _all = Asking::hold_all();
+    let _all = ask_ranges::AskingMany::hold(ask_ranges::ahead_runs(&pieces, AHEAD_GAP, AHEAD_MAX));
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < pieces.len() {
@@ -646,7 +647,16 @@ pub(crate) fn ask_line(frames: f64) {
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)]) {
-    let _all = Asking::hold_all();
+    let want: Vec<(usize, usize)> = if ask_ranges::on() {
+        ranges
+            .iter()
+            .filter(|r| r.0 < r.1)
+            .map(|&(s, e)| (s / PAGE, e.div_ceil(PAGE)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let _all = ask_ranges::AskingMany::hold(want);
     let mut ahead = {
         let mut j = journal_mut();
         std::mem::take(&mut j.ahead)
@@ -809,7 +819,7 @@ fn ask_by_reservation(ranges: &[(usize, usize)]) {
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     pieces.sort_unstable();
-    let _all = Asking::hold_all();
+    let _all = ask_ranges::AskingMany::hold(if ask_ranges::on() { pieces.clone() } else { Vec::new() });
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut rest = &pieces[..];
     let mut allocation: Option<(usize, bool)> = None;
