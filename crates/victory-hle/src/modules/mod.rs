@@ -38,6 +38,7 @@ pub mod net;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
+pub mod title_cores;
 pub(crate) mod title_used;
 pub mod xasync;
 pub mod xg;
@@ -58,6 +59,7 @@ use crate::HleModule;
 pub(crate) fn all() -> Vec<HleModule> {
     let mut all = vec![
         kernel::module(),
+        title_cores::module(),
         xgameruntime::module(),
         gameinput::module(),
         d3d12x::module(),
