@@ -112,7 +112,7 @@ static SEEN: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
 /// Reads a `T` at `at` through the kernel: a page that is not there fails
 /// the read instead of faulting.
-fn read<T: Copy + Default>(at: u64) -> Option<T> {
+pub(crate) fn read<T: Copy + Default>(at: u64) -> Option<T> {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     if at == 0 {

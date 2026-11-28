@@ -10,6 +10,9 @@
 //! stall and again just before the title's check would fire, so the
 //! thread its frame start waits on shows. When a stall over [`NOTE_OVER`]
 //! ends, it says how long it was and how many frames we began meanwhile.
+//! With the stacks it prints the fence value the title's frame end waits
+//! for, the value now, what the title asked of that fence and what our
+//! queues hold (`victory_gpu::fence_asks`).
 //!
 //! Only offsets into the title's image here; nothing changes but the log.
 
@@ -53,11 +56,11 @@ pub(crate) fn start(base: usize, size: usize) {
     };
     std::thread::Builder::new()
         .name("victory-hang-look".into())
-        .spawn(move || look(read))
+        .spawn(move || look(base, read))
         .ok();
 }
 
-fn look(read: impl Fn(usize) -> u64) {
+fn look(base: usize, read: impl Fn(usize) -> u64) {
     let start = Instant::now();
     let mut beat = read(BEAT);
     let mut since = Instant::now();
@@ -99,6 +102,7 @@ fn look(read: impl Fn(usize) -> u64) {
                 victory_loader::locate(read(HANDLER) as usize),
                 victory_hle::frames_begun().saturating_sub(frames_then),
             );
+            eprintln!("VIctory: hang look: {}", victory_hle::title_wait(base));
             victory_loader::dump_stacks();
         }
     }

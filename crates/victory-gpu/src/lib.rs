@@ -25,6 +25,8 @@ mod capture;
 mod cb_ring;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use cb_ring::title_image;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod fence_asks;
 #[cfg(windows)]
 mod compose;
 pub mod console;

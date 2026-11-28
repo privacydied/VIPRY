@@ -71,6 +71,30 @@ enum Held {
 #[cfg(windows)]
 static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+/// Diagnostics: what the queues hold back (their kinds, how many things,
+/// what the first one waits for) and what the submit thread's line holds.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn held_summary() -> String {
+    let queues = lock(&WAITING).clone();
+    let mut out = format!("queues holding {}", queues.len());
+    for q in queues {
+        // SAFETY: a live queue: one released is taken off the list.
+        let queue = unsafe { &*(q as *const Queue) };
+        let held = lock(&queue.held);
+        let first = match held.first() {
+            None => "nothing".to_string(),
+            Some(Held::Wait(fence, value)) => {
+                format!("fence {fence:#x} to reach {value} (now {})", crate::fence::completed(*fence as This))
+            }
+            Some(Held::Value(wait)) => format!("a memory value {wait:?}"),
+            Some(Held::Run(_, order)) => format!("a submission of {} lists", order.len()),
+            Some(Held::Signal(fence, value)) => format!("a signal of {fence:#x} to {value}"),
+        };
+        out += &format!(" [kind {} holds {}, first {first}]", queue.kind, held.len());
+    }
+    out + &format!("; submit line on {} with {} in it", behind::on(), behind::queued())
+}
+
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -886,20 +910,28 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     let _called = crate::timeline::span("the title's queue Signal");
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
+        #[cfg(feature = "diagnostics")]
+        crate::fence_asks::asked(fence, value, crate::fence_asks::Way::Line);
         behind::signal(this, fence, value);
         return S_OK;
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(fence as usize, value)) {
+        #[cfg(feature = "diagnostics")]
+        crate::fence_asks::asked(fence, value, crate::fence_asks::Way::Held);
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
     // fence is set when they are settled.
     #[cfg(windows)]
     if crate::host::late_signal(fence as usize, value) {
+        #[cfg(feature = "diagnostics")]
+        crate::fence_asks::asked(fence, value, crate::fence_asks::Way::Late);
         return S_OK;
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::fence_asks::asked(fence, value, crate::fence_asks::Way::Now);
     let _ = this;
     crate::fence::signal(fence, value)
 }

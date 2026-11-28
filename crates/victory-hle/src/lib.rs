@@ -16,6 +16,8 @@ mod image_watch;
 #[cfg(windows)]
 pub use victory_gpu::frame_phase;
 pub use victory_gpu::frames_begun;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use victory_gpu::fence_asks::title_wait;
 
 pub mod modules;
 mod registry;

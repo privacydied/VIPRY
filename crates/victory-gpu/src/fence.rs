@@ -200,6 +200,8 @@ pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::told("a fence set", this as usize, value);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::fence_asks::set(this, value);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
     waiters.retain(|&(wanted, event)| {
