@@ -3181,8 +3181,9 @@ impl State {
         }
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
         // (And what the queue knew of each, `known`: see `Tells`.)
+        let due_cap = if baking { 1 << 16 } else { 4096 };
         let (mut due, mut known, census) =
-            before(2, || host.texture_slots_due_known(frame, if baking { 1 << 16 } else { 4096 }));
+            before(2, || host.texture_slots_due_known(frame, due_cap));
         // (Those that are due later after all that are due.)
         let on_time = due.len();
         if baking {
@@ -3278,12 +3279,27 @@ impl State {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
+        let due_len = due.len();
+        let mut pass_staged_count = 0u64;
+        let mut pass_staged_bytes = 0u64;
+        let mut stop_reason = if due_len == 0 {
+            crate::texture::stage_why::Stop::QueueEmpty
+        } else if on_time >= due_cap {
+            crate::texture::stage_why::Stop::DueCap
+        } else {
+            crate::texture::stage_why::Stop::QueueExhausted
+        };
         let mut tells = Tells { host, told: Vec::with_capacity(Tells::BATCH) };
         use crate::descriptor::host::Told;
         for ((index, write), knew) in due.into_iter().zip(known) {
             let at_time = began.elapsed() > span;
             if at_time || SPENT.load(Ordering::Relaxed) >= bytes_at_most {
                 HEAP_TEXTURE_PASSES[if at_time { 6 } else { 7 }].fetch_add(1, Ordering::Relaxed);
+                stop_reason = if at_time {
+                    crate::texture::stage_why::Stop::Time
+                } else {
+                    crate::texture::stage_why::Stop::Bytes
+                };
                 served = false;
                 break;
             }
@@ -3442,9 +3458,11 @@ impl State {
                         // goes on, within a count that bounds one pass.
                         tells.tell(index, write, Told::Held(frame + most));
                         if refused > 1024 {
+                            stop_reason = crate::texture::stage_why::Stop::NoRoomRefused;
                             break;
                         }
                     } else if refused > 256 {
+                        stop_reason = crate::texture::stage_why::Stop::NoRoomRefused;
                         break;
                     }
                     continue;
@@ -3462,6 +3480,7 @@ impl State {
             // `mapped == 0` reclamation (`texture_slot_gone`) has run, and
             // before mirroring a slot to an unuploaded texture.
             if !rest(6, || crate::residency::admit_texture_pass(required)) {
+                stop_reason = crate::texture::stage_why::Stop::AdmitRefused;
                 served = false;
                 break;
             }
@@ -3505,6 +3524,7 @@ impl State {
             };
             let placed = timed(6, || view.as_ref().and_then(crate::descriptor::host::placed_texture));
             if crate::residency::upload_refused() {
+                stop_reason = crate::texture::stage_why::Stop::UploadRefusedPlaced;
                 served = false;
                 break;
             }
@@ -3520,6 +3540,7 @@ impl State {
             };
             let texture = timed(5, || crate::resource::host_resource(resource));
             if crate::residency::upload_refused() {
+                stop_reason = crate::texture::stage_why::Stop::UploadRefusedResource;
                 served = false;
                 break;
             }
@@ -3598,6 +3619,7 @@ impl State {
                 });
             }
             if ahead.is_none() && crate::residency::upload_refused() {
+                stop_reason = crate::texture::stage_why::Stop::UploadRefusedAhead;
                 served = false;
                 break;
             }
@@ -3618,6 +3640,7 @@ impl State {
             if ahead.is_none()
                 && (crate::residency::take_staging_deferred() || crate::residency::upload_refused())
             {
+                stop_reason = crate::texture::stage_why::Stop::StagingDeferred;
                 served = false;
                 break;
             }
@@ -3659,6 +3682,17 @@ impl State {
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
+                crate::texture::stage_why::record_pass(
+                    crate::texture::stage_why::Stop::DeviceRemoved,
+                    due_len,
+                    pass_staged_count,
+                    pass_staged_bytes,
+                    room,
+                    span.as_millis() as u64,
+                    bytes_at_most,
+                    census[0],
+                    on_time,
+                );
                 return false;
             }
             let (bytes, whole) = rest(5, || crate::texture::staged(resource, there.is_none())).unwrap_or((0, true));
@@ -3715,6 +3749,8 @@ impl State {
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            pass_staged_count += 1;
+            pass_staged_bytes += bytes;
             tells.tell(index, write, match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len, print)) => Told::Recheck(frame + again_in, (at, len), print, 0, frame),
@@ -3729,6 +3765,17 @@ impl State {
         let took = began.elapsed().as_nanos() as u64;
         HEAP_TEXTURE_NANOS[4].fetch_add(took, Ordering::Relaxed);
         HEAP_TEXTURE_PASSES[3 + kind].fetch_add(took, Ordering::Relaxed);
+        crate::texture::stage_why::record_pass(
+            stop_reason,
+            due_len,
+            pass_staged_count,
+            pass_staged_bytes,
+            room,
+            span.as_millis() as u64,
+            bytes_at_most,
+            census[0],
+            on_time,
+        );
         served
     }
 

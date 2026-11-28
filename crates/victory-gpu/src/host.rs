@@ -10095,6 +10095,7 @@ impl Meter {
                     );
                 }
                 crate::texture::staging_zeros_line();
+                crate::texture::stage_why::log(frames);
                 let served = crate::descriptor::host::SERVED.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
                 if served[0] + served[3] > 0 {
                     tracing::info!(
