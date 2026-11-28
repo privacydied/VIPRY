@@ -36,7 +36,6 @@
 //! opened blocks without the lock wait to be settled.
 
 use super::{BESIDE, Blocks, OPENING, PUBLISHED, TOLD, in_word, unsettled};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// [`super::Guards`]' block sets: read-only by our hand, clean, absent, held.
@@ -45,9 +44,11 @@ pub(super) static CLEAN_BLOCKS: Blocks = Blocks::new();
 pub(super) static ABSENT_BLOCKS: Blocks = Blocks::new();
 pub(super) static HELD_BLOCKS: Blocks = Blocks::new();
 
+/// Asked at every look, so `VICTORY_AB` can flip it mid-run (diagnostics
+/// builds): the sets are the statics either way, and a look made with the
+/// lock and one made without it can come one after the other.
 fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_FREE_LOOKS"))
+    crate::asked_for!("VICTORY_FREE_LOOKS")
 }
 
 /// Whether the guards' looks are made with no lock now.
