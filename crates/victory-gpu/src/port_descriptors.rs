@@ -78,6 +78,11 @@ pub fn marks_address() -> usize {
 /// The title's image (base, size) and how many of its stores were patched.
 static IMAGE: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
 
+/// The title's image `(base, size)`, or `(0, 0)` if not yet reported.
+pub(crate) fn image_span() -> (usize, usize) {
+    (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed))
+}
+
 /// Told by the launcher: `patched` of the title's record stores in the image
 /// at `base` (`size` bytes) mark their slots.
 pub fn hooked(base: usize, size: usize, patched: usize) {

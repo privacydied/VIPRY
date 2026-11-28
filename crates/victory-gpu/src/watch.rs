@@ -33,6 +33,7 @@ use std::sync::{Condvar, Mutex, RwLock};
 
 mod ask_noreset;
 // `VICTORY_COMMIT_MEMO`.
+pub(crate) mod writer_census;
 pub(crate) mod commit_memo;
 mod held_absent;
 // Renderer port #6 (`VICTORY_PORT_GUARD`).
@@ -3571,6 +3572,7 @@ pub(crate) fn install() {
         }
         if unlocked() && PROTECTED.any(block, block + 1) {
             if open_unlocked(block) {
+                writer_census::note_fault(at, r.ExceptionAddress as usize);
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -3613,6 +3615,7 @@ pub(crate) fn install() {
             if opened != 0 {
                 // Renderer port #2's fallback says who wrote a block of the heap.
                 crate::port_descriptors::faulted(at, r.ExceptionAddress as usize);
+                writer_census::note_fault(at, r.ExceptionAddress as usize);
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);

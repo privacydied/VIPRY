@@ -4717,6 +4717,7 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        crate::watch::writer_census::note_refresh(from, to, crate::watch::writer_census::CopyKind::Buffer);
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -4764,6 +4765,9 @@ impl Shadow {
         if self.place.is_some() {
             return true;
         }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        crate::watch::writer_census::note_nothing_new(from, to, crate::watch::writer_census::CopyKind::Buffer);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
