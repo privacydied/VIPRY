@@ -296,6 +296,7 @@ pub fn report_crashes() {
     }
     // Read the switch now, not first inside a handler.
     unwind_checks_enabled();
+    crate::crash_nest::init();
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -662,9 +663,13 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
+    // SAFETY: as above.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let (code, at) = (record.ExceptionCode, record.ExceptionAddress as usize);
+    if FATAL.contains(&code) && crate::crash_nest::enter(code as u32, at) {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
+        crate::crash_nest::leave();
     }
     EXCEPTION_CONTINUE_SEARCH
 }
@@ -675,8 +680,14 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 /// # Safety
 /// `info` comes from the system, for an exception being dispatched.
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
+    // SAFETY: the caller passes valid exception pointers.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    if !crate::crash_nest::enter(record.ExceptionCode as u32, record.ExceptionAddress as usize) {
+        return;
+    }
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
+    crate::crash_nest::leave();
 }
 
 /// The bytes at `at` as hex, as many as the longest x86 instruction (15),
