@@ -42,84 +42,28 @@ const _: () = assert!(size_of::<ResourceDesc>() == 0x38);
 
 const SWIZZLED: u32 = 0x100;
 const ROW_MAJOR: u32 = 1;
-const TILED_64KB: u32 = 2;
 const ALLOW_RENDER_TARGET: u32 = 1;
 const ALLOW_DEPTH_STENCIL: u32 = 2;
-const ALLOW_UNORDERED_ACCESS: u32 = 4;
-const DISPLAY_OR_VIDEO: u32 = 0x40_0000;
-const BUFFER: u32 = 1;
 const TEXTURE_1D: u32 = 2;
-const TEXTURE_2D: u32 = 3;
 const TEXTURE_3D: u32 = 4;
-const SMALL_UAV_MAX_BYTES: u64 = 0x8_0000;
 
-/// Bytes per texel for uncompressed formats used by `XGSuggestSwizzleMode`
-/// to choose between 4 KiB and 64 KiB XOR modes on 2D UAVs.
-fn uav_element_bytes(format: u32) -> u64 {
-    match format {
-        1..=4 => 16,
-        5..=8 => 12,
-        9..=22 => 8,
-        23..=47 | 67 | 87..=93 | 116 | 117 | 189 | 191 => 4,
-        48..=59 | 68 | 69 | 85 | 86 | 115 => 2,
-        60..=65 | 190 => 1,
-        _ => 0,
-    }
-}
-
-/// The mode the console's layout library picks for a resource description:
-/// linear for buffers and 1D, 64 KiB Z_X for depth, 64 KiB D for tiled
-/// 64 KiB layouts, 64 KiB R_X for render targets and large/MSAA 2D UAVs,
-/// 4 KiB S_X for small single-sample 2D UAVs, else 4 KiB S.
-fn suggested(desc: &ResourceDesc, flags: u32) -> Result<Swizzle, HRESULT> {
-    if (desc.flags & ALLOW_RENDER_TARGET != 0) && (desc.flags & ALLOW_DEPTH_STENCIL != 0) {
-        return Err(E_INVALIDARG);
-    }
-    if (flags & 3) == 3 {
-        return Err(E_INVALIDARG);
-    }
-    if desc.dimension == BUFFER || desc.dimension == TEXTURE_1D {
-        return Ok(Swizzle::LINEAR);
-    }
-    if desc.flags & ALLOW_DEPTH_STENCIL != 0 {
-        return Ok(Swizzle::SW_64KB_Z_X);
-    }
-    if (desc.flags & DISPLAY_OR_VIDEO != 0)
-        && (desc.flags & (ALLOW_RENDER_TARGET | ALLOW_UNORDERED_ACCESS) != 0)
-    {
-        return Ok(Swizzle::SW_64KB_R_X);
-    }
-    let prefer_4kb = flags & 2 != 0;
-    match desc.dimension {
-        TEXTURE_3D => {
-            if desc.layout == TILED_64KB {
-                Ok(Swizzle::SW_64KB_D)
-            } else if desc.flags & ALLOW_RENDER_TARGET != 0 {
-                Ok(Swizzle::SW_64KB_R_X)
-            } else {
-                Ok(Swizzle::SW_4KB_S)
-            }
-        }
-        TEXTURE_2D => {
-            if desc.layout == TILED_64KB {
-                Ok(Swizzle::SW_64KB_D)
-            } else if desc.flags & ALLOW_RENDER_TARGET != 0 {
-                Ok(if prefer_4kb { Swizzle::SW_4KB_S } else { Swizzle::SW_64KB_R_X })
-            } else if desc.flags & ALLOW_UNORDERED_ACCESS != 0 {
-                if prefer_4kb {
-                    return Ok(Swizzle::SW_4KB_S);
-                }
-                let bpp = uav_element_bytes(desc.format);
-                let small = desc.samples <= 1
-                    && bpp != 0
-                    && bpp.saturating_mul(desc.width).saturating_mul(u64::from(desc.height))
-                        <= SMALL_UAV_MAX_BYTES;
-                Ok(if small { Swizzle::SW_4KB_S_X } else { Swizzle::SW_64KB_R_X })
-            } else {
-                Ok(Swizzle::SW_4KB_S)
-            }
-        }
-        _ => Err(E_INVALIDARG),
+/// The mode the console's library picks for a description: linear for 1D,
+/// the XOR render and depth modes for targets, else 4 KiB standard
+/// (`.ttpf` textures without a mode of their own use it).
+///
+/// shortcut: the rule of the library's older optimal-mode function (any
+/// size, 2D, 3D and cubes alike); `XGSuggestSwizzleMode` itself is newer
+/// than every copy we could check. Revisit if streamed textures come out
+/// scrambled.
+fn suggested(desc: &ResourceDesc) -> Swizzle {
+    if desc.dimension == TEXTURE_1D {
+        Swizzle::LINEAR
+    } else if desc.flags & ALLOW_DEPTH_STENCIL != 0 {
+        Swizzle::SW_64KB_Z_X
+    } else if desc.flags & ALLOW_RENDER_TARGET != 0 {
+        Swizzle::SW_64KB_R_X
+    } else {
+        Swizzle::SW_4KB_S
     }
 }
 
@@ -127,19 +71,16 @@ fn suggested(desc: &ResourceDesc, flags: u32) -> Result<Swizzle, HRESULT> {
 /// result in the description's layout field.
 pub extern "system" fn XGSuggestSwizzleMode(
     desc: *const ResourceDesc,
-    flags: u32,
+    _flags: u32,
     out: *mut u32,
 ) -> HRESULT {
     // SAFETY: the title passes a description and room for the layout
     // (either may be null).
     match unsafe { (desc.as_ref(), out.as_mut()) } {
-        (Some(desc), Some(out)) => match suggested(desc, flags) {
-            Ok(mode) => {
-                *out = SWIZZLED | mode.0;
-                S_OK
-            }
-            Err(hr) => hr,
-        },
+        (Some(desc), Some(out)) => {
+            *out = SWIZZLED | suggested(desc).0;
+            S_OK
+        }
         _ => E_INVALIDARG,
     }
 }
@@ -201,7 +142,7 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
         _ => return None,
     };
     let swizzle = match desc.layout {
-        0 => suggested(desc, 0).ok()?,
+        0 => suggested(desc),
         ROW_MAJOR => Swizzle::LINEAR,
         l if l & !0xff == SWIZZLED => Swizzle(l & 0xff),
         _ => return None,
