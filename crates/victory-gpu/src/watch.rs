@@ -3316,6 +3316,8 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     commit_memo::changed(at, len);
     crate::texback::remapped(at, len);
+    #[cfg(feature = "diagnostics")]
+    crate::unmapped_look::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
 

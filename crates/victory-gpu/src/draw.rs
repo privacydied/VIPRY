@@ -3379,12 +3379,16 @@ impl State {
                 let mapped = timed(1, || crate::texture::mapped_bytes(address as *const u8, len as usize));
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    crate::unmapped_look::passed_over(index, write, address, len, frame);
                     outcome(slot_outcome::AWAY);
                     // Streamed out: what the slot showed is let go.
                     rest(0, || host.texture_slot_gone(index));
                     tells.tell(index, write, Told::Later(frame, most));
                     continue;
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::unmapped_look::looked_mapped(index, write, frame);
                 rest(0, || host.texture_slot_here(index));
                 there = Some(mapped);
                 if mapped < len {

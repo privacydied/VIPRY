@@ -91,6 +91,8 @@ mod picked;
 mod pool;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod popwatch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod unmapped_look;
 #[cfg(windows)]
 mod primitive;
 pub mod query;

@@ -3940,6 +3940,8 @@ fn late_line(frames: f64) {
     crate::watch::port_guard_line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
+    crate::unmapped_look::log();
+    #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
         let [pages, runs, bytes, read, in_parts] = crate::shadow::merged_stats().map(|n| n as f64 / frames);

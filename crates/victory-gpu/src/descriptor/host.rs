@@ -3430,6 +3430,8 @@ impl HostHeap {
             }
         };
         if !stale.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            crate::unmapped_look::stale(&stale);
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
             // Only the ones the queue may hold.
             let queued: Vec<u32> = stale.iter().map(|&(slot, _)| slot).filter(|&slot| self.queued(slot) != Some(false)).collect();
