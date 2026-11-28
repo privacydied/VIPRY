@@ -184,6 +184,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    if !at.is_null() {
+        super::title_used::BOOKS.virtual_allocated(base as usize, at as usize, size, kind);
+    }
     // Write-combined: memory the title's CPU writes and does not read.
     if !at.is_null() && asked & 0x400 != 0 {
         victory_gpu::title_memory_write_combined(at as usize, size);
@@ -384,6 +387,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     if wc {
         victory_gpu::title_memory_write_combined(user as usize, size);
     }
+    super::title_used::BOOKS.heap_allocated(size);
     user.cast()
 }
 
@@ -400,6 +404,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
             if wc {
                 victory_gpu::title_memory_freed(address as usize, 0);
             }
+            super::title_used::BOOKS.virtual_freed(address as usize, 0, MEM_RELEASE);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -408,6 +413,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         if wc {
             victory_gpu::title_memory_freed(address as usize, size.saturating_sub(align));
         }
+        super::title_used::BOOKS.heap_freed(size.saturating_sub(align));
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -751,6 +757,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    super::title_used::BOOKS.physical_allocated(size);
     let section = Arc::new(Section {
         handle,
         pages: n,
@@ -793,6 +800,7 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     // Dropped without the lock: the last page of a section unmaps its window.
     let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
     drop(table);
+    super::title_used::BOOKS.physical_freed(gone.len() * PAGE);
     drop(gone);
     1
 }
@@ -2721,9 +2729,12 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+    let title_limit = gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed);
+    // `VICTORY_TITLE_USED=1`: what the title holds through our calls.
+    let held = super::title_used::on().then(|| super::title_used::BOOKS.used().min(title_limit));
     let stats = WorkingSet {
-        title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_limit,
+        title_used: held.unwrap_or(counters.PagefileUsage),
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
@@ -2733,16 +2744,19 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     // limit of 13.5 GB). A title that budgets its streaming from these two
     // figures believes it is far over its limit.
     // shortcut: the figure is not yet the title's own memory alone (its
-    // heaps and the pages it mapped); count those if this line shows the
-    // title asking.
+    // heaps and the pages it mapped) unless `VICTORY_TITLE_USED=1`
+    // (`title_used`) counts those.
     static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let asked = ASKED.fetch_add(1, Ordering::Relaxed);
-    if asked.is_multiple_of(1024) {
+    if asked.is_multiple_of(1024) || super::title_used::due() {
         tracing::info!(
             asked = asked + 1,
             which = _which,
             limit_mb = stats.title_limit >> 20,
             used_mb = stats.title_used >> 20,
+            process_mb = counters.PagefileUsage >> 20,
+            held_mb = super::title_used::BOOKS.used() >> 20,
+            title_used = held.is_some(),
             "the title asks how much memory it uses"
         );
     }
@@ -2782,6 +2796,7 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
+        super::title_used::BOOKS.virtual_freed(address as usize, size, kind);
     }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }

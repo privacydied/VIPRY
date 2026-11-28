@@ -38,6 +38,7 @@ pub mod net;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
+pub(crate) mod title_used;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;
