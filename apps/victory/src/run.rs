@@ -380,6 +380,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     watch(image.base(), image.info().size_of_image as usize);
     timers(image.base(), image.info().size_of_image as usize);
     poke(image.base(), image.info().size_of_image as usize);
+    crate::hang_look::start(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;

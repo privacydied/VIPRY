@@ -6,6 +6,8 @@
 #[cfg(all(windows, target_env = "msvc", feature = "agility"))]
 mod agility;
 mod census;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod hang_look;
 mod inspect;
 #[cfg(windows)]
 mod play;
