@@ -24,6 +24,7 @@
 #[cfg(windows)]
 mod console_insn;
 mod crash;
+mod crash_nest;
 #[cfg(windows)]
 pub mod descriptor_sites;
 pub mod frame_rate;
