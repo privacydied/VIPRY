@@ -12,6 +12,7 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+mod unpadded;
 
 thread_local! {
     /// Set while this thread runs the pass over textures picked by index
@@ -1625,6 +1626,7 @@ pub(crate) extern "system" fn create_placed_srv(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        let (resource, desc) = (unpadded::resource(resource), unpadded::view(false, desc));
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1636,6 +1638,7 @@ pub(crate) extern "system" fn create_placed_uav(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        let (resource, desc) = (unpadded::resource(resource), unpadded::view(true, desc));
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -2033,8 +2036,11 @@ mod tests {
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
         // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        // (Padding words zero, as they are kept: `unpadded`.)
+        let resource: [u32; 14] =
+            unpadded::resource(std::array::from_fn(|k| 0x5ee0_0000 + k as u32));
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        desc[3] = 0;
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
             View::Placed(_, r, _) => *r == resource,
