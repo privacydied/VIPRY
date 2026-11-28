@@ -33,6 +33,10 @@ mod cbv_raw;
 type Why = &'static str;
 
 mod alike;
+mod nan_scrub;
+use nan_scrub::nan_scrub;
+#[cfg(test)]
+pub(super) use nan_scrub::TEST_SCRUB;
 #[cfg(test)]
 pub(super) use alike::readfirstlane_sources_alike;
 mod partial;
@@ -11758,6 +11762,10 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
+            // `VICTORY_NAN_SCRUB` (`nan_scrub.rs`).
+            for v in &mut vals {
+                *v = self.scrub_nan(*v);
+            }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
@@ -13374,6 +13382,8 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
+            // `VICTORY_NAN_SCRUB` (`nan_scrub.rs`): a pixel program's colours.
+            let colour = self.s.pixel && !mesh && matches!(e.target, Target::Color(_)) && nan_scrub();
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             // `VICTORY_LEAN_MATH` bit 16: a pixel program's float outputs are
@@ -13384,7 +13394,7 @@ impl<'a> Lower<'a> {
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => {
                     let mut f = self.as_float(x);
-                    if safe && (self.s.pixel || param) {
+                    if safe && (self.s.pixel || param) || colour {
                         f = self.finite_or_zero(f);
                     }
                     (".f32", f)
@@ -13396,6 +13406,7 @@ impl<'a> Lower<'a> {
                     };
                     if safe && param && !(self.s.pixel && !mesh)
                         || lean_math() & 16 != 0 && self.s.pixel && !mesh
+                        || colour
                     {
                         f = self.finite_or_zero(f);
                     }

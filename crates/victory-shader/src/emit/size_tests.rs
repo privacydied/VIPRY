@@ -421,3 +421,44 @@ fn a_store_of_some_channels_writes_zero_to_the_rest() {
         }
     }
 }
+
+/// `VICTORY_NAN_SCRUB=1`: a float image store writes 0 for NaN and the
+/// infinities and keeps finite values; off, the store writes what it got.
+#[test]
+fn the_nan_scrub_makes_bad_floats_in_an_image_store_zero() {
+    let mov = |n: u32, src: u32| 0x7E00_0200 | n << 17 | src;
+    let words = [
+        0xF40C_0201u32, // s_load_dwordx8 s[8:15], s[2:3], 0
+        0xFA00_0000,
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        mov(2, 255),
+        0x7FC0_0000, // v2 = NaN
+        mov(3, 255),
+        0x7F80_0000, // v3 = +inf
+        mov(4, 255),
+        0xFF80_0000, // v4 = -inf
+        mov(5, 242), // v5 = 1.0
+        0xF020_1F08, // image_store v[2:5], v[0:1], s[8:15] dmask:0xf 2D
+        0x0002_0200,
+        0xBE84_0380, // s_mov_b32 s4, 0
+        0xBE85_0380, // s_mov_b32 s5, 0
+    ];
+    let program = |scrub: bool| {
+        super::lower::TEST_SCRUB.set(Some(scrub));
+        let shader = build(&[TABLE, &words, STORE].concat(), (8, 0)).expect("translates");
+        super::lower::TEST_SCRUB.set(None);
+        shader
+    };
+    let (off, on) = (program(false), program(true));
+    assert_ne!(off.dxil, on.dxil);
+    let texel = [[0.0; 4]; 1];
+    let views = [View::TextureUav(1, 1), View::Texture(1, 1, &texel), View::RawUav(2)];
+    for (label, got) in run(&on, &views) {
+        assert_eq!(got[..4], [0, 0, 0, 0x3F80_0000], "{label}: on");
+    }
+    for (label, got) in run(&off, &views) {
+        assert_eq!(got[1..4], [0x7F80_0000, 0xFF80_0000, 0x3F80_0000], "{label}: off");
+        assert!(f32::from_bits(got[0]).is_nan(), "{label}: off keeps NaN");
+    }
+}
