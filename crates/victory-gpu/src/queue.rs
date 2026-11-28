@@ -9,6 +9,8 @@ use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
 mod behind;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod present_hist;
 #[cfg(windows)]
 mod stand;
 
@@ -1286,6 +1288,7 @@ extern "system" fn present(
 /// Diagnostics: the title's present is over.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn frame_ends() {
+    present_hist::presented();
     crate::timeline::presented();
     crate::faultbook::frame();
     crate::ab::presented(|switch, was, will| {
