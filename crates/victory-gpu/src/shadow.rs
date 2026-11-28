@@ -4533,16 +4533,40 @@ impl Shadow {
         same
     }
 
+    /// [`Shadow::nothing_new`] using a shared [`crate::watch::ReadJournal`] guard.
+    pub(crate) fn nothing_new_in(
+        &self,
+        journal: &crate::watch::ReadJournal,
+        address: usize,
+        len: usize,
+    ) -> bool {
+        if !refresh_split() {
+            return self.nothing_new_with(Some(journal), address, len);
+        }
+        let began = std::time::Instant::now();
+        let same = self.nothing_new_with(Some(journal), address, len);
+        REFRESH_SPLIT[0].fetch_add(1, Ordering::Relaxed);
+        REFRESH_SPLIT[1].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        same
+    }
+
     /// [`Shadow::nothing_new`] without the clock.
     fn nothing_new_untimed(&self, address: usize, len: usize) -> bool {
+        self.nothing_new_with(None, address, len)
+    }
+
+    fn nothing_new_with(
+        &self,
+        journal: Option<&crate::watch::ReadJournal>,
+        address: usize,
+        len: usize,
+    ) -> bool {
         if self.place.is_some() {
             return true;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         crate::watch::writer_census::note_nothing_new(from, to, crate::watch::writer_census::CopyKind::Buffer);
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
             return true;
         }
@@ -4554,7 +4578,10 @@ impl Shadow {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = match journal {
+            Some(j) => j.nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to)),
+            None => crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to)),
+        };
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};

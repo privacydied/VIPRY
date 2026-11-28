@@ -443,6 +443,25 @@ pub(super) fn polled(by: Poll, shadow: &crate::shadow::Shadow, address: usize, l
     nothing
 }
 
+/// [`polled`] using a shared [`crate::watch::ReadJournal`] guard.
+pub(super) fn polled_in(
+    journal: &crate::watch::ReadJournal,
+    by: Poll,
+    shadow: &crate::shadow::Shadow,
+    address: usize,
+    len: usize,
+) -> bool {
+    let cell = &POLLED[by as usize];
+    cell[0].fetch_add(1, Ordering::Relaxed);
+    if !crate::shadow::refresh_split() {
+        return shadow.nothing_new_in(journal, address, len);
+    }
+    let began = std::time::Instant::now();
+    let nothing = shadow.nothing_new_in(journal, address, len);
+    cell[1].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    nothing
+}
+
 /// What made a flush of refreshes happen.
 #[derive(Clone, Copy)]
 pub(super) enum Cause {

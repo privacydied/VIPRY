@@ -33,6 +33,7 @@ use std::sync::{Condvar, Mutex, RwLock};
 
 mod ask_noreset;
 // `VICTORY_COMMIT_MEMO`.
+pub(crate) mod read_journal;
 pub(crate) mod writer_census;
 pub(crate) mod commit_memo;
 mod held_absent;
@@ -402,10 +403,14 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         i = k;
     }
     note_hot(&written);
+    let ordered = read_journal::on();
+    if ordered {
+        read_journal::coalesce_intervals(&mut asked);
+    }
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
     j.ahead = asked;
-    j.ordered = false;
+    j.ordered = ordered;
     let now = j.ahead_asked;
     for (page, parts) in written {
         j.note(page, parts, now);
@@ -671,16 +676,19 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.note(page, parts, now);
     }
+    let ordered = read_journal::on();
+    if ordered {
+        read_journal::coalesce_intervals(&mut ahead);
+    }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
-    j.ordered = false;
+    j.ordered = ordered;
 }
 
 /// Whether the journal's asking ahead holds pages `[first, last)`.
 fn covers(j: &Journal, first: usize, last: usize) -> bool {
     if j.ordered {
-        let i = j.ahead.partition_point(|&(_, end)| end < last);
-        j.ahead.get(i).is_some_and(|&(start, _)| start <= first)
+        read_journal::contains_interval(&j.ahead, first, last)
     } else {
         j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
     }
@@ -1041,13 +1049,22 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     Some(answer)
 }
 
-/// Whether nothing of `[start, end)` was written that a copy with the notes
-/// `copied` (the asking after which each page from page `base` on was taken)
-/// and `ranged` (the asking after which a range that holds this one was
-/// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
-/// asked: the submission's asking covers the range, or its blocks are known
-/// by their bits. `false` if something would have to be asked.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+/// A shared read-only view of [`JOURNAL`] that callers can acquire once per
+/// flush instead of locking on every copy in [`nothing_new`]. Must be dropped
+/// before calling anything that asks the kernel or mutates the journal.
+pub(crate) struct ReadJournal(std::sync::RwLockReadGuard<'static, Journal>);
+
+pub(crate) fn read_journal() -> ReadJournal {
+    ReadJournal(journal())
+}
+
+impl ReadJournal {
+    pub(crate) fn nothing_new(&self, start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+        nothing_new_with(&self.0, start, end, base, copied, ranged)
+    }
+}
+
+fn nothing_new_with(j: &Journal, start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
@@ -1055,8 +1072,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     if known {
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
-    let j = journal();
-    if !known && !covers(&j, first, last) {
+    if !known && !covers(j, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -1064,6 +1080,17 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     };
     (ranged != 0 || taken.iter().all(|&at| at != 0))
         && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+}
+
+/// Whether nothing of `[start, end)` was written that a copy with the notes
+/// `copied` (the asking after which each page from page `base` on was taken)
+/// and `ranged` (the asking after which a range that holds this one was
+/// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
+/// asked: the submission's asking covers the range, or its blocks are known
+/// by their bits. `false` if something would have to be asked.
+pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+    let j = journal();
+    nothing_new_with(&j, start, end, base, copied, ranged)
 }
 
 impl Tracked {

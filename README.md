@@ -79,6 +79,8 @@ elsewhere names its source and author.
   formats.
 - **[ProjectLeonida/mandy](https://github.com/ProjectLeonida/mandy)**: the order
   of in-place indirect arguments for renderer port 1.
+- **[CHECK6960/Victory-Nvidia-optimized](https://github.com/CHECK6960/Victory-Nvidia-optimized)**:
+  coalesced ahead-interval search and shared read-journal guard.
 
 ## License
 

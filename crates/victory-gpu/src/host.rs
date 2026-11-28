@@ -9136,7 +9136,13 @@ impl Batch {
         if !many {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !lean::polled(lean::Poll::Front, shadow, *from, *to - *from));
+            if crate::watch::read_journal::on() {
+                let journal = crate::watch::read_journal();
+                spans.retain(|(shadow, from, to)| !lean::polled_in(&journal, lean::Poll::Front, shadow, *from, *to - *from));
+                drop(journal);
+            } else {
+                spans.retain(|(shadow, from, to)| !lean::polled(lean::Poll::Front, shadow, *from, *to - *from));
+            }
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
