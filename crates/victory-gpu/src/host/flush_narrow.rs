@@ -19,17 +19,18 @@
 //! submission's last flush. Work that may write anywhere (`Step::Run`) still
 //! flushes all. The textures are handled as before.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use super::Batch;
 
-/// Whether it is on (`=0` turns it off).
+/// Whether it is on (`=0` turns it off). Each step asks again, so in
+/// diagnostics builds `VICTORY_AB` may turn it on and off while the title runs.
 pub(super) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| parse(std::env::var("VICTORY_FLUSH_NARROW").ok().as_deref()))
+    crate::toggled!("VICTORY_FLUSH_NARROW")
 }
 
+/// What `toggled!` reads the variable as: unset or anything but `0` is on.
+#[cfg(test)]
 fn parse(val: Option<&str>) -> bool {
     !matches!(val, Some("0"))
 }

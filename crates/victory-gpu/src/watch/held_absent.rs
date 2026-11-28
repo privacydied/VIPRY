@@ -16,14 +16,16 @@
 //! `title_memory_remapped` already clear `g.held` and `PUBLISHED` on told
 //! changes, and `look_at_holes` still audits 1/100th of `g.held` each frame.
 
-use std::sync::OnceLock;
-
-/// Whether `VICTORY_HELD_ABSENT` is enabled (`=0` turns it off).
+/// Whether `VICTORY_HELD_ABSENT` is enabled (`=0` turns it off). Blocks held
+/// while it was on stay held until a told change clears them, as with it on,
+/// so in diagnostics builds `VICTORY_AB` may turn it on and off while the
+/// title runs.
 pub(super) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| parse(std::env::var("VICTORY_HELD_ABSENT").ok().as_deref()))
+    crate::toggled!("VICTORY_HELD_ABSENT")
 }
 
+/// What `toggled!` reads the variable as: unset or anything but `0` is on.
+#[cfg(test)]
 fn parse(val: Option<&str>) -> bool {
     !matches!(val, Some("0"))
 }

@@ -20,7 +20,16 @@
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
+/// Each look asks again, so in diagnostics builds `VICTORY_AB` may turn it on
+/// and off while the title runs: a look is made shared or alone either way.
 fn on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: OnceLock<Option<u32>> = OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_SHARED_LOOKS")) {
+            return crate::ab::on(bit);
+        }
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_SHARED_LOOKS"))
 }
