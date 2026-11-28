@@ -8351,6 +8351,7 @@ fn submit_split_line(frames: f64) {
     lean::line(frames);
     front_wait::line(frames);
     crate::watch::free_looks_line(frames);
+    crate::watch::protect_line(frames);
     crate::shadow::refresh_split_line(frames);
     lean::walks_line(frames);
     sets::line(frames);

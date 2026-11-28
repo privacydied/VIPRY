@@ -43,6 +43,10 @@ mod port_guard;
 mod shared_looks;
 // `VICTORY_FREE_LOOKS`.
 mod free_looks;
+// Our changes of protection, counted.
+mod protect_count;
+pub(crate) use protect_count::line as protect_line;
+use protect_count::By;
 pub(crate) use free_looks::line as free_looks_line;
 pub(crate) use port_guard::{port_guard, port_guard_line, port_guard_plan};
 use port_guard::{
@@ -1489,7 +1493,7 @@ static FAULTS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::A
 /// protection could not be changed).
 fn open_unlocked(block: usize) -> bool {
     use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
     if OPENING.swap_on(block) {
@@ -1518,14 +1522,11 @@ fn open_unlocked(block: usize) -> bool {
     PUBLISHED.clear(block);
     put_count(block).store(0, Relaxed);
     let at = std::time::Instant::now();
-    let mut old = 0;
-    // SAFETY: a block we made read-only.
-    let mut done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
+    let (mut done, old) = protect_count::set(By::FaultUnlocked, block, block + 1, PAGE_READWRITE);
     if done && !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
         // Not what we left there (as in `unguard`): other memory's, which
         // keeps its protection.
-        // SAFETY: as above.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old) };
+        protect_count::set(By::FaultUnlocked, block, block + 1, old);
         done = false;
     }
     #[cfg(feature = "diagnostics")]
@@ -2635,7 +2636,7 @@ fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) ->
 /// One that is clean stays so: had the page been written since its copies
 /// took it, [`open`] would have opened it. Whether it is read-only now.
 fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     g.alias(block);
     if let Some(claims) = claims
         && !claims.holds(block)
@@ -2674,11 +2675,9 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
     }
     // Ahead of the protection.
     PROTECTED.set(block);
-    let mut old = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: title view memory; only its protection changes.
-    let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
+    let (done, old) = protect_count::set(By::Alias, block, block + 1, PAGE_READONLY);
     #[cfg(feature = "diagnostics")]
     {
         tally(5, 1);
@@ -2692,8 +2691,7 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
     }
     if done {
         // Not for us to guard: as it was.
-        // SAFETY: as above.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old) };
+        protect_count::set(By::Alias, block, block + 1, old);
     }
     PROTECTED.clear(block);
     false
@@ -2701,25 +2699,16 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
 
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     let set = |from: usize, to: usize| {
-        let mut old = 0;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        // SAFETY: title view memory; only its protection changes.
-        let mut done = unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
-        };
+        let by = if to - from == 1 { By::GuardBlock } else { By::GuardRun };
+        let (mut done, old) = protect_count::set(by, from, to, PAGE_READONLY);
         if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
             // What is there is not for us to guard (code, or memory the
             // title protects itself): as it was.
-            // SAFETY: as above.
-            unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
+            protect_count::set(by, from, to, old);
             done = false;
         }
         #[cfg(feature = "diagnostics")]
@@ -2844,7 +2833,7 @@ fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> 
 
 /// Gives write access back to `blocks`, guarded ones.
 fn unguard(g: &Guards, blocks: &[usize]) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // All of them before the first can be written: a write through one is a
@@ -2855,16 +2844,11 @@ fn unguard(g: &Guards, blocks: &[usize]) {
         PUBLISHED.clear(block);
     }
     for &block in blocks {
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe {
-            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
-            {
-                // Not what we left there: the address is other memory's
-                // (code's, say), which keeps its protection.
-                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
-            }
+        let (done, old) = protect_count::set(By::Open, block, block + 1, PAGE_READWRITE);
+        if done && !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+            // Not what we left there: the address is other memory's
+            // (code's, say), which keeps its protection.
+            protect_count::set(By::Open, block, block + 1, old);
         }
         PROTECTED.clear(block);
     }
@@ -3637,7 +3621,7 @@ pub(crate) fn install() {
             let began = std::time::Instant::now();
             // (Let go again before the next look: the runtime wants the
             // guards to end a change.)
-            let (opened, waited) = open_faulted(at);
+            let (opened, waited) = protect_count::in_fault(|| open_faulted(at));
             let _ = waited;
             if opened != 0 {
                 // Renderer port #2's fallback says who wrote a block of the heap.
