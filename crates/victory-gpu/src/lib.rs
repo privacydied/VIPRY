@@ -21,6 +21,10 @@ mod ambient;
 mod aspect;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod cb_ring;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use cb_ring::title_image;
 #[cfg(windows)]
 mod compose;
 pub mod console;

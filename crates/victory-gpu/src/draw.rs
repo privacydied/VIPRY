@@ -4758,6 +4758,8 @@ impl State {
                             continue;
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
+                        #[cfg(feature = "diagnostics")]
+                        crate::cb_ring::filled(address, u64::from(size));
                         list.defer_constants(to, address as *const u8, size as usize, slot);
                         host.constant_at(index, &buffer, gpu, size);
                     }

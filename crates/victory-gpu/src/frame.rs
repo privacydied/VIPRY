@@ -224,6 +224,8 @@ pub(crate) extern "system" fn wait(
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::cb_ring::look();
         // `VICTORY_REFLEX`: the frame's Reflex index is settled here
         // (nothing without the switch). This wait is the title's own start
         // of a frame, once per frame (only a wait that makes a token gets
