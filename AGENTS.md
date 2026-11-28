@@ -12,10 +12,7 @@ Target: RTX 3090, Ryzen 7 3700X, 31 GB RAM, Steam with Proton Experimental.
 
 ## Rules for content
 
-- Nothing from any game enters this repository: no game files, executables,
-  shaders (in any form, their names included), textures, audio, screenshots, or
-  logs that quote them. Shader hashes and plain numbers (fps, milliseconds,
-  megabytes, counts, error codes) are fine.
+
 - Do not name games, publishers or their staff in code, comments, commits or pull
   requests. Say "the title".
 - Do not loosen `crates/victory-hle/src/modules/net.rs`: the title may only reach
