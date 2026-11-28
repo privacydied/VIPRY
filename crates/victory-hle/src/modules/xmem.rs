@@ -336,30 +336,14 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 }
 
 /// The system allocator behind [`XMemAlloc`].
-const PAGE_WRITECOMBINE: u32 = 0x400;
-
-/// Whether the `XALLOC_MEMTYPE` field (`(attributes >> 29) & 0xf`) maps to
-/// write-combined memory (`PAGE_WRITECOMBINE`): graphics WC (1), graphics
-/// WC GPU-readonly (2), command-buffer WC (5), physical WC (8), and
-/// graphics executable WC (12).
-const fn is_write_combined_mem_type(attributes: u64) -> bool {
-    matches!((attributes >> 29) & 0xf, 1 | 2 | 5 | 8 | 12)
-}
-
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
-    let wc = is_write_combined_mem_type(attributes);
     if attributes & ALLOC_32BIT != 0 {
-        let protect = if wc {
-            PAGE_READWRITE | PAGE_WRITECOMBINE
-        } else {
-            PAGE_READWRITE
-        };
         return XMemVirtualAlloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
-            protect,
+            PAGE_READWRITE,
         );
     }
     let Some(layout) = layout(size, attributes) else {
@@ -375,20 +359,16 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
     }
+    super::title_used::BOOKS.heap_allocated(size);
     // SAFETY: the block holds the alignment (at least the header) and then
     // `size` bytes.
-    let user = unsafe {
+    unsafe {
         let user = block.add(layout.align());
         user.sub(HEADER)
             .cast::<[usize; 2]>()
             .write([layout.size(), layout.align()]);
-        user
-    };
-    if wc {
-        victory_gpu::title_memory_write_combined(user as usize, size);
+        user.cast()
     }
-    super::title_used::BOOKS.heap_allocated(size);
-    user.cast()
 }
 
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
@@ -396,23 +376,16 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
         return;
     }
-    let wc = is_write_combined_mem_type(attributes);
     // SAFETY: the address came from `XMemAlloc` with these attributes: a
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            if wc {
-                victory_gpu::title_memory_freed(address as usize, 0);
-            }
             super::title_used::BOOKS.virtual_freed(address as usize, 0, MEM_RELEASE);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
-        if wc {
-            victory_gpu::title_memory_freed(address as usize, size.saturating_sub(align));
-        }
         super::title_used::BOOKS.heap_freed(size.saturating_sub(align));
         dealloc(
             user.sub(align),
