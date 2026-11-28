@@ -39,6 +39,9 @@ mod held_absent;
 mod port_guard;
 // `VICTORY_SHARED_LOOKS`.
 mod shared_looks;
+// `VICTORY_FREE_LOOKS`.
+mod free_looks;
+pub(crate) use free_looks::line as free_looks_line;
 pub(crate) use port_guard::{port_guard, port_guard_line, port_guard_plan};
 use port_guard::{
     Claims, P6_NOT_ASKED, VIEWS, forget_views, guard_shared, known_views, open_faulted, port6_count, refused_as_view,
@@ -1661,6 +1664,10 @@ fn publish(pages: &[usize]) {
         }
         return;
     }
+    if free_looks::now() {
+        free_looks::publish(pages);
+        return;
+    }
     let g = if shared_looks::now() { shared_looks::Held::Shared(guards_shared()) } else { shared_looks::Held::Alone(guards()) };
     let g: &Guards = &g;
     for &page in pages {
@@ -2016,15 +2023,17 @@ fn hot() -> Option<std::time::Duration> {
 }
 
 struct Guards {
+    // (The four sets are statics of `free_looks`, which looks at them with no
+    // lock: `VICTORY_FREE_LOOKS`.)
     /// Blocks we made read-only.
-    protected: Blocks,
+    protected: &'static Blocks,
     /// Of those, the ones not written since a copy took them.
-    clean: Blocks,
+    clean: &'static Blocks,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
-    absent: Blocks,
+    absent: &'static Blocks,
     /// Of those, the ones in placeholders ([`known_holes`]).
-    held: Blocks,
+    held: &'static Blocks,
     /// Blocks that were absent and turned out to be other memory than views
     /// when something was there again: never guarded, copied every time.
     foreign: BTreeSet<usize>,
@@ -2100,10 +2109,10 @@ impl Guards {
 /// Read by many threads at once with renderer port #6 ([`port_guard`]), held
 /// alone otherwise and by what changes more than single blocks' states.
 static GUARDS: RwLock<Guards> = RwLock::new(Guards {
-    protected: Blocks::new(),
-    clean: Blocks::new(),
-    absent: Blocks::new(),
-    held: Blocks::new(),
+    protected: &free_looks::PROTECTED_BLOCKS,
+    clean: &free_looks::CLEAN_BLOCKS,
+    absent: &free_looks::ABSENT_BLOCKS,
+    held: &free_looks::HELD_BLOCKS,
     foreign: BTreeSet::new(),
     kernel: Vec::new(),
     changing: Vec::new(),
@@ -2350,7 +2359,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         && (PROTECTED.any(first, first + 1) || {
             // (Renderer port #6: shared, a look only.)
             let of = |g: &Guards| g.protected.contains(first) || g.absent.contains(first);
-            if shared_looks::now() { of(&guards_timed_shared()) } else { of(&guards_timed()) }
+            if free_looks::now() {
+                free_looks::known(first)
+            } else if shared_looks::now() {
+                of(&guards_timed_shared())
+            } else {
+                of(&guards_timed())
+            }
         });
     if !known && !is_view(start, end) {
         return None;
@@ -2369,7 +2384,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         };
         // (Renderer port #6: shared, a look only. A block a fault opens
         // meanwhile was clean, read-only and unwritten when looked at.)
-        let unsure = if shared_looks::now() { of(&guards_timed_shared()) } else { of(&guards_timed()) };
+        let unsure = if free_looks::now() {
+            free_looks::unsure(first, last)
+        } else if shared_looks::now() {
+            of(&guards_timed_shared())
+        } else {
+            of(&guards_timed())
+        };
         match unsure {
             Some(unsure) => unsure,
             None => {
@@ -2402,6 +2423,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             (first..last).for_each(|block| VIEWS.set(block));
         }
         return Some(guard_shared(first, last, &came, rest));
+    }
+    if came.is_empty() && free_looks::now() && free_looks::nothing_written(first, last) {
+        return Some(Vec::new());
     }
     let mut g = guards_timed();
     #[cfg(feature = "diagnostics")]
