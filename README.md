@@ -68,6 +68,17 @@ elsewhere names its source and author.
 - **[stellarr-studio/kelvaroq](https://github.com/stellarr-studio/kelvaroq)**:
   pipeline stand-ins and warm-up, wave64 pairing, async present, mesh launch.
   Only Kelvaroq's own GPL-3.0 code is here; nothing from XCL (GPL-2.0-only).
+- **[Kemerd/VIctory-NVIDIA-RT](https://github.com/Kemerd/VIctory-NVIDIA-RT)**:
+  graphics pipelines from pieces, heap views, ultrawide, HDR10 output, DLSS
+  Ray Reconstruction, Reflex.
+- **[Slaktarn700/SlaktarnVI](https://github.com/Slaktarn700/SlaktarnVI)**: a core
+  for the submitting thread, the A/B report script.
+- **[Spaghetih/victory-sley-fork](https://github.com/Spaghetih/victory-sley-fork)**:
+  the pipeline workers' stack size.
+- **[uiliannn/VItoriaBr](https://github.com/uiliannn/VItoriaBr)**: texture
+  formats.
+- **[ProjectLeonida/mandy](https://github.com/ProjectLeonida/mandy)**: the order
+  of in-place indirect arguments for renderer port 1.
 
 ## License
 
