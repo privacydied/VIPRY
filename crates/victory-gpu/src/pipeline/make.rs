@@ -58,11 +58,6 @@ pub(crate) struct Pending {
     replayed: AtomicBool,
     /// Microseconds first uses waited for it, over all frames ([`super::wait_each`]).
     waited_us: AtomicU64,
-    /// When a draw or dispatch first asked for it ([`stamp`]; 0: none has),
-    /// and when it was put on [`Queue::requested`] (0: it was not). Both for
-    /// [`skip_wait`].
-    asked_ms: AtomicU64,
-    queued_ms: AtomicU64,
 }
 
 /// Whether a compute shader of the pipeline carries `name`, a pipeline from
@@ -212,8 +207,6 @@ impl Pending {
             usage: OnceLock::new(),
             replayed: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
-            asked_ms: AtomicU64::new(0),
-            queued_ms: AtomicU64::new(0),
         }
     }
 
@@ -466,10 +459,6 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         }
     }
     if p.made.get().is_none() {
-        // (Noted on every call until it is: beside `used` above, a second
-        // thread could find `used` set and the time not yet.)
-        let first = p.asked_ms.load(Ordering::Relaxed) == 0
-            && p.asked_ms.compare_exchange(0, stamp(), Ordering::Relaxed, Ordering::Relaxed).is_ok();
         start(p, REQUESTED);
         if standins() && p.compatibility().is_some() {
             if let Some(real) = p.made.get() {
@@ -480,98 +469,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             }
             STANDIN_MISSES.fetch_add(1, Ordering::Relaxed);
         }
-        wait(p, crate::frame::current(), first);
+        wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
-}
-
-/// [`crate::host::now_ms`], never 0 (its first call returns 0): 0 stands for
-/// "never" where these are kept.
-fn stamp() -> u64 {
-    crate::host::now_ms().max(1)
-}
-
-/// How long ago `then` ([`stamp`]) was; `None` for 0.
-fn since(then: u64, now: u64) -> Option<Duration> {
-    (then != 0).then(|| Duration::from_millis(now.saturating_sub(then)))
-}
-
-/// Why [`wait`] does not wait ([`skip_wait`]).
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum Skip {
-    /// It was first asked for longer ago than a frame's budget.
-    Old,
-    /// No worker has it, and the oldest requested pipeline no worker has
-    /// taken has stood for longer than a frame's budget.
-    Behind,
-}
-
-/// Whether a wait for a pipeline can be given up before it begins, because it
-/// cannot end within `budget`: `in_hand` is whether a worker is making it,
-/// `front` how long the oldest entry of [`Queue::requested`] has stood there
-/// (`None`: the list is empty), `asked` how long ago it was first asked for
-/// (`None`: just now).
-///
-/// A pipeline that was asked for a whole budget ago was waited for then (or
-/// was skipped for the reason below) and is still not made: a wait in every
-/// later frame only holds the list. And while the front of the line has stood
-/// a whole budget with no worker free for it, one behind it that no worker has
-/// begun cannot be made in a budget either. A burst of new pipelines on a warm
-/// cache has a young front (the workers take them within milliseconds), so its
-/// first uses keep their waits; the length of the line says nothing of that
-/// and is not asked.
-fn skip_wait(in_hand: bool, front: Option<Duration>, asked: Option<Duration>, budget: Duration) -> Option<Skip> {
-    if asked.is_some_and(|asked| asked > budget) {
-        Some(Skip::Old)
-    } else if !in_hand && front.is_some_and(|front| front > budget) {
-        Some(Skip::Behind)
-    } else {
-        None
-    }
-}
-
-/// When the oldest entry of [`Queue::requested`] was put there ([`stamp`]; 0:
-/// the list is empty). Written under [`QUEUE`]'s lock, read by [`wait`]
-/// without it.
-static FRONT_MS: AtomicU64 = AtomicU64::new(0);
-
-/// Whether [`wait`] counts what it does and says so every few seconds:
-/// `VICTORY_PIPELINE_WAIT_ONCE=1` or `=count` (the latter changes nothing
-/// else, for the run to compare with).
-fn waits_counted() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_some_and(|v| v == "1" || v == "count"))
-}
-
-/// Since the last line of [`waits_said`]: waits begun, microseconds waited,
-/// waits that ended with the budget and no pipeline, waits not begun for
-/// [`Skip::Old`], for [`Skip::Behind`], and those of the latter that were the
-/// pipeline's first use.
-static WAITS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-
-/// One line of [`WAITS`] at most every five seconds, from the thread that
-/// ends a wait then (a list thread of ours, or a recording thread).
-fn waits_said() {
-    static SAID_MS: AtomicU64 = AtomicU64::new(0);
-    let (now, last) = (stamp(), SAID_MS.load(Ordering::Relaxed));
-    if now.saturating_sub(last) < 5_000 || SAID_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
-        return;
-    }
-    let n: Vec<u64> = WAITS.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
-    tracing::info!(
-        "waits for host pipelines by draws and dispatches in the last {:.1} s: {} begun, {} ms waited in all, {} ended with \
-         the budget and no pipeline; not waited for: {} first asked for longer ago than the budget, {} behind a line that \
-         stood longer than the budget ({} of them a first use); {} being made (VICTORY_PIPELINE_WAIT_ONCE=1 leaves those \
-         waits out, =count only counts)",
-        now.saturating_sub(last) as f64 / 1e3,
-        n[0],
-        n[1] / 1000,
-        n[2],
-        n[3],
-        n[4],
-        n[5],
-        waiting(),
-    );
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -654,24 +554,8 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// `VICTORY_PIPELINE_WAIT_BACKLOG=n` (read once, unset by default): past
-/// `n` pipelines queued, a draw's pipeline is not waited for at all and the
-/// draw is dropped at once, as it is when the budget runs out. Unset, every
-/// draw waits as before.
-fn backlog() -> Option<u64> {
-    static MOST: OnceLock<Option<u64>> = OnceLock::new();
-    *MOST.get_or_init(|| {
-        let most = std::env::var("VICTORY_PIPELINE_WAIT_BACKLOG").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        if let Some(most) = most {
-            tracing::info!(most, "host pipelines are not waited for while more than this many are queued");
-        }
-        most
-    })
-}
-
-/// Waits for `p` while frame `frame` has budget left; `first` is whether this
-/// is the first time a draw or dispatch asks for it.
-fn wait(p: &Pending, frame: u64, first: bool) {
+/// Waits for `p` while frame `frame` has budget left.
+fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() || super::spare::given_up(p) {
@@ -684,50 +568,6 @@ fn wait(p: &Pending, frame: u64, first: bool) {
     };
     if own.is_zero() {
         return;
-    }
-    // with more queued than the workers can make within the budget, the
-    // pipeline asked for here will not arrive in time, and waiting only
-    // costs the frame: run 5 spent the whole 500 ms in every frame for two
-    // minutes while 470 were queued (about 290 ms a frame, two frames in
-    // the line), run 10 sat at 3 fps with 600 queued. passes over the
-    // screen keep their own budget and workers.
-    if !screen && backlog().is_some_and(|most| WAITING.load(Ordering::Relaxed) > most) {
-        return;
-    }
-    // `VICTORY_PIPELINE_WAIT_ONCE=1` (off by default): a wait that cannot end
-    // within the budget is not begun ([`skip_wait`]). Without it a thread
-    // takes what is left of the frame's budget in every frame in which a
-    // pipeline it draws with is unmade, whether or not a worker has it: the
-    // list stands, the line behind it does, and the title waits at its
-    // present. Up to about 215 ms a frame while pipelines asked for long ago
-    // are unmade (run of 2026-11-26 with the title's ray tracing, the same
-    // place before and after its queue ran empty: list threads 780 to 260 ms a
-    // frame, the title at its presents 258 to 41 ms). A cold pipeline first
-    // asked for while the workers keep up still costs one wait of up to the
-    // budget, as before: of the two rules only the one about the line applies
-    // to a first use, and a pass the title runs once is never asked for a
-    // second time, so the rule about age cannot lose it. Passes over the
-    // screen keep their own budget. Compiled and tested, not yet seen in a
-    // run; the line of [`waits_said`] is what a run shows it by.
-    let counted = !screen && waits_counted();
-    if !screen && p.made.get().is_none() && crate::asked_for!("VICTORY_PIPELINE_WAIT_ONCE") {
-        let now = stamp();
-        let skip = skip_wait(
-            p.queue_state.load(Ordering::Relaxed) == MAKING,
-            since(FRONT_MS.load(Ordering::Relaxed), now),
-            since(p.asked_ms.load(Ordering::Relaxed), now),
-            budget,
-        );
-        if let Some(skip) = skip {
-            if counted {
-                WAITS[if skip == Skip::Old { 3 } else { 4 }].fetch_add(1, Ordering::Relaxed);
-                if skip == Skip::Behind && first {
-                    WAITS[5].fetch_add(1, Ordering::Relaxed);
-                }
-                waits_said();
-            }
-            return;
-        }
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
@@ -766,14 +606,6 @@ fn wait(p: &Pending, frame: u64, first: bool) {
         p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
     }
     super::drop_why::waited(started.elapsed(), p.made.get().is_some());
-    if counted {
-        WAITS[0].fetch_add(1, Ordering::Relaxed);
-        WAITS[1].fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
-        if p.made.get().is_none() {
-            WAITS[2].fetch_add(1, Ordering::Relaxed);
-        }
-        waits_said();
-    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -865,7 +697,6 @@ impl Queue {
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
-            p.queued_ms.store(stamp(), Ordering::Relaxed);
             self.requested.push_back(p.clone());
         } else if priority == REPLAY {
             self.replay.push_back(p.clone());
@@ -915,12 +746,6 @@ impl Queue {
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
-
-    /// When the oldest requested pipeline no worker has taken was queued
-    /// ([`FRONT_MS`]).
-    fn front_ms(&self) -> u64 {
-        self.requested.front().map_or(0, |p| p.queued_ms.load(Ordering::Relaxed))
-    }
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
@@ -946,7 +771,6 @@ fn start(p: &Arc<Pending>, priority: u8) {
         // (One woken could be a worker that takes passes over the screen
         // alone: it would leave the pipeline to nobody.)
         AVAILABLE.notify_all();
-        FRONT_MS.store(queue.front_ms(), Ordering::Relaxed);
     }
 }
 
@@ -957,7 +781,6 @@ fn next(screens_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if let Some(p) = queue.pop(screens_only, slow_limit()) {
-            FRONT_MS.store(queue.front_ms(), Ordering::Relaxed);
             // Nothing asked for is left: the extra threads may take slow
             // ones now ([`slow_extras`]).
             if EXTRAS.load(Ordering::Relaxed) > 0
@@ -1330,53 +1153,6 @@ mod tests {
         assert_eq!(extras_for(20, 16, 32), 12);
         assert_eq!(extras_for(4, 16, 8), 0);
         assert_eq!(extras_for(0, 2, 32), 0);
-    }
-
-    /// A wait is given up before it begins only when it cannot end within
-    /// the budget: the pipeline was first asked for longer ago than that, or
-    /// no worker has it and the front of the line has stood that long.
-    #[test]
-    fn a_wait_that_cannot_end_in_the_budget_is_not_begun() {
-        let budget = Duration::from_millis(500);
-        let (young, old) = (Some(Duration::from_millis(20)), Some(Duration::from_millis(501)));
-        // A first use on a warm cache: the front is young, the wait is kept.
-        assert_eq!(skip_wait(false, young, Some(Duration::ZERO), budget), None);
-        assert_eq!(skip_wait(false, None, None, budget), None);
-        // In a worker's hands and asked for within the budget: kept, whatever the line.
-        assert_eq!(skip_wait(true, old, young, budget), None);
-        assert_eq!(skip_wait(true, old, Some(budget), budget), None);
-        // Asked for longer ago than the budget: not begun, in hand or not.
-        assert_eq!(skip_wait(true, young, old, budget), Some(Skip::Old));
-        assert_eq!(skip_wait(false, None, old, budget), Some(Skip::Old));
-        // No worker has it and the front has stood a budget: not begun, a first use too.
-        assert_eq!(skip_wait(false, old, Some(Duration::ZERO), budget), Some(Skip::Behind));
-        assert_eq!(skip_wait(false, old, None, budget), Some(Skip::Behind));
-        // A time never noted is "just now", not "long ago".
-        assert_eq!(since(0, 10_000), None);
-        assert_eq!(since(1, 601), Some(Duration::from_millis(600)));
-        assert_eq!(since(700, 601), Some(Duration::ZERO));
-        assert_eq!(skip_wait(true, None, since(0, 10_000), budget), None);
-    }
-
-    /// The front of the requested line is the oldest entry no worker took.
-    #[test]
-    fn the_front_of_the_line_is_the_oldest_requested_one() {
-        let new = || Arc::new(Pending::new(Vec::new(), None));
-        let (early, first, second) = (new(), new(), new());
-        let mut queue = Queue::new();
-        assert_eq!(queue.front_ms(), 0);
-        assert_eq!(queue.push_as(&early, EARLY, false), Some(true));
-        assert_eq!(queue.front_ms(), 0);
-        assert_eq!(queue.push_as(&first, REQUESTED, false), Some(true));
-        first.queued_ms.store(7, Ordering::Relaxed);
-        assert_eq!(queue.push_as(&second, REQUESTED, false), Some(true));
-        second.queued_ms.store(9, Ordering::Relaxed);
-        assert_eq!(queue.front_ms(), 7);
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &first));
-        assert_eq!(queue.front_ms(), 9);
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &second));
-        assert_eq!(queue.front_ms(), 0);
-        assert_eq!(early.queued_ms.load(Ordering::Relaxed), 0);
     }
 
     /// Passes over the screen go before all others, and workers of their own
