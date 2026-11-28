@@ -281,6 +281,7 @@ extern "system" fn check_feature_support(
         MULTISAMPLE => 16,
         _ => {
             tracing::warn!(feature, size, "device feature query not implemented");
+            crate::failure_note::note("device feature query (slot = feature)", feature as usize, E_NOTIMPL);
             return E_NOTIMPL;
         }
     };
@@ -440,6 +441,7 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
+    crate::failure_note::note("device pipeline creation", SLOT, E_NOTIMPL);
     E_NOTIMPL
 }
 

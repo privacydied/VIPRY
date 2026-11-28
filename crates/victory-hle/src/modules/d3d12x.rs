@@ -22,6 +22,8 @@ extern "system" fn create_device(
     victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    victory_gpu::on_failure_note(victory_loader::note_failure);
     device::create(adapter, parameters, iid, out)
 }
 

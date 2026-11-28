@@ -27,6 +27,8 @@ mod crash;
 mod crash_nest;
 #[cfg(windows)]
 pub mod descriptor_sites;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod hle_last;
 pub mod frame_rate;
 pub mod prepare;
 pub(crate) mod publish;
@@ -56,6 +58,8 @@ pub use crash::{
 };
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use hle_last::note_failure;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(windows)]

@@ -76,6 +76,8 @@ mod launch;
 pub mod list;
 #[cfg(windows)]
 pub mod loading;
+mod failure_note;
+pub use failure_note::on_failure_note;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

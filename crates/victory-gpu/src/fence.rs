@@ -183,11 +183,13 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
                 return S_OK;
             }
             tracing::warn!(value, "blocking fence wait timed out");
+            crate::failure_note::note("fence blocking wait, timed out", 0, E_NOTIMPL);
             return E_NOTIMPL;
         }
         // shortcut: a null event means "block until reached"; nothing can
         // reach it while no GPU work runs, so fail instead of hanging.
         tracing::warn!(value, "blocking fence wait not implemented");
+        crate::failure_note::note("fence blocking wait", 0, E_NOTIMPL);
         return E_NOTIMPL;
     }
     waiters.push((value, event as usize));

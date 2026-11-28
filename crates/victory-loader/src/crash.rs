@@ -813,6 +813,10 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
+    #[cfg(feature = "diagnostics")]
+    for l in crate::hle_last::lines() {
+        line(l);
+    }
     if to_file {
         let said = title_output();
         eprint!("{said}");

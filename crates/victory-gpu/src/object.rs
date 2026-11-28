@@ -309,6 +309,7 @@ extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
             "method not implemented"
         );
     }
+    crate::failure_note::note(KINDS[KIND], SLOT * 8, E_NOTIMPL);
     E_NOTIMPL
 }
 
