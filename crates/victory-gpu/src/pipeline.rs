@@ -1074,6 +1074,8 @@ pub(crate) mod host;
 #[cfg(windows)]
 pub mod known;
 #[cfg(windows)]
+mod left_out_log;
+#[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;

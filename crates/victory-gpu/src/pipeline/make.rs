@@ -218,6 +218,9 @@ impl Pending {
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
         let left_out = left_out(&shaders);
+        if let Some(why) = left_out {
+            super::left_out_log::note(&shaders, why);
+        }
         Pending {
             screen,
             scene_input,
