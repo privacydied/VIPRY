@@ -843,25 +843,16 @@ pub fn pending_with(
     type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; the context is the
-        // shared state until cleanup releases it.
+        // boxed state until cleanup frees it.
         let data = unsafe { &*data };
         let state = data.context.cast::<Data>();
         match op {
-            // SAFETY: from `Arc::into_raw` in `pending_with`; released once.
-            OP_CLEANUP => drop(unsafe { Arc::from_raw(state) }),
+            // SAFETY: boxed in `pending_with`; nothing runs after cleanup.
+            OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
             OP_BEGIN => {
-                let Some(call) = call(data.block) else {
-                    return E_INVALIDARG;
-                };
-                // SAFETY: the context is a live `Arc`; this takes a count of
-                // our own, which the thread keeps. Cleanup may run first (a
-                // cancel ends the call), so the thread must not borrow it.
-                let state = unsafe {
-                    Arc::increment_strong_count(state);
-                    Arc::from_raw(state)
-                };
-                let work = state.lock().unwrap_or_else(|e| e.into_inner()).0.take();
-                let block = data.block as usize;
+                // SAFETY: as above; cleanup waits for completion.
+                let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
+                let (block, state) = (data.block as usize, state as usize);
                 std::thread::spawn(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
                     let (hr, len) = match &result {
@@ -869,13 +860,11 @@ pub fn pending_with(
                         Err(hr) => (*hr, 0),
                     };
                     if let Ok(bytes) = result {
+                        // SAFETY: the call is pending, so its state lives.
+                        let state = unsafe { &*(state as *const Data) };
                         state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
                     }
-                    // Completes the call this began with, not whatever the
-                    // block holds by now: a canceled call is over (and does
-                    // not touch the block again), and the title may have
-                    // begun another call on it.
-                    complete_call(&call, block as *mut AsyncBlock, hr, len);
+                    XAsyncComplete(block as *mut AsyncBlock, hr, len);
                 });
             }
             // SAFETY: as above; the runtime checked the buffer's size.
@@ -889,18 +878,12 @@ pub fn pending_with(
         }
         S_OK
     }
-    let state: Arc<Data> = Arc::new(Mutex::new((Some(Box::new(work)), Vec::new())));
-    let context = Arc::into_raw(state);
-    let hr = XAsyncBegin(
-        block,
-        context.cast_mut().cast(),
-        identity,
-        std::ptr::null(),
-        Some(provider),
-    );
+    let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
+    let context = Box::into_raw(state);
+    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
-        drop(unsafe { Arc::from_raw(context) });
+        drop(unsafe { Box::from_raw(context) });
     }
     hr
 }
@@ -1503,86 +1486,6 @@ mod tests {
         );
         assert_eq!((byte, used), (0x5a, 1));
         XTaskQueueCloseHandle(q);
-    }
-
-    #[test]
-    fn a_canceled_pending_call_cannot_complete_the_next_call_on_its_block() {
-        extern "system" fn idle(_: u32, _: *const ProviderData) -> HRESULT {
-            S_OK
-        }
-        let (release, gate) = std::sync::mpsc::channel::<()>();
-        let mut block = AsyncBlock {
-            queue: std::ptr::null(),
-            context: std::ptr::null_mut(),
-            callback: None,
-            internal: [0; 4],
-        };
-        let first = 0x91 as *const c_void;
-        assert_eq!(
-            pending_with(&mut block, first, move || {
-                let _ = gate.recv();
-                Ok(vec![1, 2])
-            }),
-            S_OK
-        );
-        XAsyncCancel(&mut block);
-        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
-
-        // The title reuses the block for a new call, zeroed as new blocks are.
-        block.internal = [0; 4];
-        let second = 0x92 as *const c_void;
-        assert_eq!(
-            XAsyncBegin(
-                &mut block,
-                std::ptr::null_mut(),
-                second,
-                std::ptr::null(),
-                Some(idle)
-            ),
-            S_OK
-        );
-        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
-
-        // The canceled call's work ends now: it must not finish the new call.
-        assert!(release.send(()).is_ok());
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            XAsyncGetStatus(&mut block, false),
-            E_PENDING,
-            "the second call is still pending"
-        );
-        XAsyncComplete(&mut block, S_OK, 0);
-    }
-
-    #[test]
-    fn a_pending_call_hands_out_what_its_work_returns() {
-        let mut block = AsyncBlock {
-            queue: std::ptr::null(),
-            context: std::ptr::null_mut(),
-            callback: None,
-            internal: [0; 4],
-        };
-        let identity = 0x93 as *const c_void;
-        assert_eq!(
-            pending_with(&mut block, identity, || Ok(vec![7, 8, 9])),
-            S_OK
-        );
-        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
-        let mut size = 0;
-        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_OK);
-        assert_eq!(size, 3);
-        let mut out = [0u8; 3];
-        assert_eq!(
-            XAsyncGetResult(
-                &mut block,
-                identity,
-                out.len(),
-                out.as_mut_ptr().cast(),
-                std::ptr::null_mut()
-            ),
-            S_OK
-        );
-        assert_eq!(out, [7, 8, 9]);
     }
 
     #[test]

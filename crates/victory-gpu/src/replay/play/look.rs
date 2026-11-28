@@ -174,9 +174,7 @@ pub fn flow(
                     | Cmd::CopyResource { .. }
                     | Cmd::Resolve { .. }
                     | Cmd::ClearDepth { .. }
-                    | Cmd::ClearTarget { .. }
-                    | Cmd::ClearUavFloat { .. }
-                    | Cmd::GlobalSync {} => line(&format!("{here}:{n} {c:?}")),
+                    | Cmd::ClearTarget { .. } => line(&format!("{here}:{n} {c:?}")),
                     c if c.runs_shaders() && (compute || draws) => {
                         let name = pipelines.get(&pso).map_or("", |p| p.name.as_str());
                         line(&format!("{here}:{n} {c:?} pso {pso} {name}"));

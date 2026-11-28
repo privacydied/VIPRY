@@ -519,7 +519,7 @@ fn ask_early(every: std::time::Duration) {
                 idle = 0;
             }
             round += 1;
-            if round.is_multiple_of(64) {
+            if round % 64 == 0 {
                 hot.retain(|_, n| {
                     *n /= 2;
                     *n > 0

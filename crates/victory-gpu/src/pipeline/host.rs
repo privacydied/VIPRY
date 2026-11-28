@@ -1179,7 +1179,6 @@ impl HostPipeline {
                     });
                 }
             }
-            super::samplers::know(&t.static_samplers);
             // With the sampler tables on, a stage whose samplers a heap can
             // hold (and for which the tail has room) gets a table; else its
             // samplers stay static, and the pipeline stays out of the library.

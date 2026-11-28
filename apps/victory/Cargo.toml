@@ -22,9 +22,8 @@ clap.workspace = true
 walkdir.workspace = true
 
 [features]
-# Kept so that older build commands still work: every build now exports
-# `D3D12SDKVersion` and `D3D12SDKPath` (main.rs) and asks for the `D3D12`
-# folder's runtime, or Windows' own where there is none.
+# The Windows 10 build: loads Microsoft's D3D12 Agility SDK from a `D3D12`
+# folder next to the exe (src/agility.rs). Never for the plain build.
 agility = []
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.

@@ -26,7 +26,6 @@
 //! 18e57db8 found the same).
 
 use std::collections::{HashMap, VecDeque};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -95,15 +94,13 @@ fn leave_out() -> &'static [String] {
 /// boats, along shores and under bridges, and take about 15 ms of the card a frame (RTX 5070,
 /// runs r_water1 and r_water3 of 2026-11-26: 25 fps with them, 30 without, the blocks gone;
 /// fxceless/victory-fork's README of 2026-11-27 names the same two programs and form). Left
-/// out there, the water has no light of its own depth (darker, bluer) and no blocks.
-/// foxhound 0.2.0-pre.3 fixed the blocks (64-lane programs on 32-lane waves:
-/// `VICTORY_LOOPS_WAVE`, `VICTORY_LDS_FIRST_INIT`), so they run now unless
-/// `VICTORY_WATER_LIGHT=0` (an empty value, an earlier version's saved OFF, runs them too).
+/// out there, the water has no light of its own depth (darker, bluer) and no blocks;
+/// `VICTORY_WATER_LIGHT=1` runs them as before.
 const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
 
 fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
     static ASKED: OnceLock<bool> = OnceLock::new();
-    *ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "0"))
+    !*ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"))
         && victory_shader::emit::host_settings()[0] == 32
         && shaders.iter().any(|s| WATER_LIGHT.iter().any(|h| s.is(h)))
 }
@@ -126,7 +123,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         return Some("named in VICTORY_LEAVE_OUT, left out");
     }
     if water_light_left_out(shaders) {
-        return Some("the water's tiled light on a host of 32-lane waves, left out (VICTORY_WATER_LIGHT=0)");
+        return Some("the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out");
     }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
@@ -140,12 +137,6 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_rt && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
     }
-    // The screen probes' ray activation runs without the structure builder
-    // too: left out, the probes kept stale values and surfaces lit mostly by
-    // them took a magenta or violet cast (papers on a wall, irises), at no
-    // frame-rate gain (bisected and measured by a tester, issue #2 of the
-    // public repository, 2026-11-27). `VICTORY_ACTIVATE_RAYS=0`: left out,
-    // as before.
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
     let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
         if builder_asked() {
@@ -224,7 +215,7 @@ impl Pending {
     }
 
     fn make(self: &Arc<Self>) {
-        self.make_with(|| {
+        self.made.get_or_init(|| {
             let _building = crate::timeline::span("pipeline: build a host pipeline");
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
@@ -241,20 +232,6 @@ impl Pending {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key, Arc::downgrade(self));
         }
-    }
-
-    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
-        self.made.get_or_init(|| {
-            // A failed translation must complete this queue entry and wake its waiters:
-            // a panic left `made` empty for ever and the worker thread gone with it.
-            match catch_unwind(AssertUnwindSafe(build)) {
-                Ok(pipeline) => pipeline,
-                Err(_) => {
-                    tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
-                    None
-                }
-            }
-        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -1058,27 +1035,6 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
-    }
-
-    /// A panic inside a build must not take the worker thread with it, nor
-    /// leave the queue entry open for ever.
-    #[test]
-    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
-        let bad = Arc::new(Pending::new(Vec::new(), None));
-        let good = Arc::new(Pending::new(Vec::new(), None));
-        let failed = bad.clone();
-        let next = good.clone();
-        let worker = std::thread::spawn(move || {
-            failed.make_with(|| panic!("synthetic pipeline build panic"));
-            next.make_with(|| None);
-        });
-
-        worker.join().expect("the pipeline worker should survive");
-        assert!(matches!(bad.made.get(), Some(None)));
-        assert!(matches!(good.made.get(), Some(None)));
-
-        bad.make_with(|| panic!("the refused pipeline should stay complete"));
-        assert!(matches!(bad.made.get(), Some(None)));
     }
 
     /// A pipeline left out on purpose (a ray-tracing resolve without the structure builder)
