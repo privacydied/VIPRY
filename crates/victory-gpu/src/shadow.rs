@@ -25,6 +25,10 @@ use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
 mod exact_fast;
+// `VICTORY_REFRESH_DIRTY`.
+mod dirty;
+// `VICTORY_REFRESH_DIRTY`: the card lists' marks.
+mod card_marks;
 // The title's bytes under flights' writes, compared and put in in one pass.
 mod small_bar;
 mod take_batch;
@@ -48,8 +52,9 @@ pub(crate) struct Shadow {
     start: u64,
     len: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
-    /// after which it was last copied (0: never).
-    copied: Mutex<Vec<u64>>,
+    /// after which it was last copied (0: never), with a bitmask of the
+    /// pages never copied ([`dirty::Pages`]).
+    copied: Mutex<dirty::Pages>,
     /// Two ranges of title memory taken whole, the last one and the longest,
     /// and the asking after which each was ([`Shadow::copy_stale`]). A page
     /// a range holds in part cannot say so in `copied`. Locked inside
@@ -138,6 +143,8 @@ struct Card {
     sent: Mutex<SentRuns>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
+    /// Whether `dirty` and `sent` hold anything, read without their locks.
+    marks: card_marks::Marks,
     /// The copy itself, set once it is in an `Arc` ([`carded`]): put on
     /// [`TOUCHED`] when `touched` is set.
     me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
@@ -693,6 +700,10 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
 struct SentRuns(Vec<(u64, Vec<(usize, usize)>)>);
 
 impl SentRuns {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     #[cfg(test)]
     fn note(&mut self, number: u64, ranges: Vec<(usize, usize)>) {
         self.note_joined(number, joined(ranges));
@@ -764,7 +775,10 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.forget(fetched);
                     sent.note_joined(sent_as, ranges.clone());
+                    // Before `has_dirty` goes down.
+                    c.marks.sent(!sent.is_empty());
                 }
+                c.marks.taken();
                 ranges
             })
             .unwrap_or_default();
@@ -3464,7 +3478,7 @@ pub(crate) fn window_use() -> [u64; 8] {
     let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+        let pages = copied.copied_count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
         if crate::host::references(&s.buffer) > 1 {
             out[1] += 1;
@@ -3662,7 +3676,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
+            copied: Mutex::new(dirty::Pages::new(pages as usize)),
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
@@ -3694,9 +3708,7 @@ impl Shadow {
     /// watch names, cut to their written parts and compared by dwords
     /// against the zeros of the CPU's side, as every later refresh does.
     fn start_fresh(&mut self) {
-        for at in self.copied.get_mut().unwrap_or_else(|e| e.into_inner()).iter_mut() {
-            *at = FRESH_TAKEN;
-        }
+        self.copied.get_mut().unwrap_or_else(|e| e.into_inner()).fill(FRESH_TAKEN);
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -4203,6 +4215,7 @@ impl Shadow {
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
+            Some((_, written)) if dirty::on() => copied.has_stale_in(base, a, e, &written),
             Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
             None => true,
         })
@@ -4269,7 +4282,11 @@ impl Shadow {
             // read under the same lock as the list.
             let (stale, took): (Vec<usize>, Vec<u64>) = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                let stale = stale_pages_in(base, &copied, a, e, &written);
+                let stale = if dirty::on() {
+                    copied.stale_pages_in(base, a, e, &written)
+                } else {
+                    stale_pages_in(base, &copied, a, e, &written)
+                };
                 let took = stale.iter().map(|&page| copied.get(page - base).copied().unwrap_or(0)).collect();
                 (stale, took)
             };
@@ -4380,9 +4397,7 @@ impl Shadow {
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 for page in taken {
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
-                    }
+                    copied.set(page - base, now);
                 }
             }
             under_ns(4, t);
@@ -4579,10 +4594,14 @@ impl Shadow {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = match journal {
-            Some(j) => j.nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to)),
-            None => crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to)),
-        };
+        let (ranged, base) = (self.ranged(from, to), start / PAGE);
+        // A page never copied says no, and the bitmask finds one without
+        // `nothing_new` looking at every page.
+        let same = (!dirty::on() || ranged != 0 || copied.all_copied(from / PAGE - base, (to - 1) / PAGE - base))
+            && match journal {
+                Some(j) => j.nothing_new(from, to, base, &copied, ranged),
+                None => crate::watch::nothing_new(from, to, base, &copied, ranged),
+            };
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4704,6 +4723,17 @@ impl Shadow {
         // copies, every frame. A range that was taken whole, and not written
         // since, is as it was.
         let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        if dirty::on() {
+            // The pages never copied and those written, not every page.
+            let (runs, again_at) = copied.plan_stale(base, start, end, from, to, now, ranged, written);
+            let runs = if runs.is_empty() || again_at.is_empty() {
+                runs
+            } else {
+                by_parts(runs, &again_at, &crate::watch::parts_written(&again_at))
+            };
+            return self.take_planned(from, to, now, runs);
+        }
         let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
         // Pages taken before and written since: in the order of their runs.
         let mut again_at: Vec<(usize, u64)> = Vec::new();
@@ -4716,14 +4746,12 @@ impl Shadow {
                 }
                 _ => 0,
             };
-            let at = &mut copied[page - base];
-            let taken = (*at).max(ranged);
+            let taken = copied[page - base].max(ranged);
             if taken == 0 || write > taken {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
+                    copied.set(page - base, now);
                 }
                 // Cut where pages taken before meet pages never taken.
                 let again = taken != 0;
@@ -4746,6 +4774,14 @@ impl Shadow {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
         let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
+        self.take_planned(from, to, now, runs)
+    }
+
+    /// The end of [`Shadow::copy_stale`]: takes the `runs` planned for
+    /// `[from, to)` and notes the range taken whole at `now`. The caller
+    /// still holds `copied`'s lock (a refresh that began later waits for the
+    /// bytes it would skip).
+    fn take_planned(&self, from: usize, to: usize, now: u64, runs: Vec<(usize, usize, bool)>) -> usize {
         if refresh_split() {
             for &(a, b, known) in &runs {
                 REFRESH_SPLIT[if known { 3 } else { 2 }].fetch_add((b - a) as u64, Ordering::Relaxed);
@@ -4996,6 +5032,7 @@ impl Shadow {
                 _ => dirty.push((from, to)),
             }
         }
+        card.marks.dirtied();
         // (Under the lock: what takes the list sees it or finds it set.)
         if !card.touched.swap(true, Ordering::AcqRel)
             && let Some(me) = card.me.get()
@@ -5257,13 +5294,7 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
-        let skip: Vec<(usize, usize)> = {
-            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < at + n && b > at).collect();
-            sent.near(fetched_after, at, at + n, &mut skip);
-            skip
-        };
+        let skip = card_marks::skip(card, at, at + n, fetched_after);
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
@@ -5322,6 +5353,7 @@ impl Shadow {
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                marks: Default::default(),
                 me: std::sync::OnceLock::new(),
                 size: len.next_multiple_of(PIECE as u64),
             });
@@ -5345,12 +5377,18 @@ impl Shadow {
         let mut sent = card.sent.lock().unwrap();
         sent.forget(merged);
         sent.note(number, ranges.clone());
+        card.marks.sent(!sent.is_empty());
+        card.marks.taken();
         ranges
     }
 
     /// What is to go up to the card, taken.
     pub(crate) fn take_dirty(&self) -> Vec<(usize, usize)> {
-        std::mem::take(&mut *self.card.as_ref().unwrap().dirty.lock().unwrap())
+        let card = self.card.as_ref().unwrap();
+        let mut dirty = card.dirty.lock().unwrap();
+        let ranges = std::mem::take(&mut *dirty);
+        card.marks.taken();
+        ranges
     }
 }
 
@@ -5377,13 +5415,7 @@ impl Shadow {
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
         let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
-        let skip: Vec<(usize, usize)> = {
-            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
-            sent.near(fetched_after, from, to, &mut skip);
-            skip
-        };
+        let skip = card_marks::skip(card, from, to, fetched_after);
         let mut put = 0;
         for &(lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
@@ -5449,12 +5481,12 @@ impl Shadow {
             return false;
         };
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(at) = copied.get_mut(page) else {
+        let Some(&at) = copied.get(page) else {
             return false;
         };
-        let held = *at != 0 && *at >= before && crate::watch::block_published(block);
+        let held = at != 0 && at >= before && crate::watch::block_published(block);
         if held {
-            *at = (*at).max(now);
+            copied.set(page, at.max(now));
         }
         held
     }
@@ -5479,6 +5511,7 @@ mod land_tests {
             dirty: Mutex::default(),
             sent: Mutex::default(),
                 touched: Default::default(),
+                marks: Default::default(),
                 me: std::sync::OnceLock::new(),
             size: len as u64,
         });
@@ -5555,7 +5588,12 @@ mod land_tests {
                     bytes(shadow.data as usize).copy_from_slice(&held);
                     let card = shadow.card.as_ref().expect("made with one");
                     *card.dirty.lock().unwrap() = dirty.clone();
-                    *card.sent.lock().unwrap() = super::SentRuns::of(&sent);
+                    if !dirty.is_empty() {
+                        card.marks.dirtied();
+                    }
+                    let sent = super::SentRuns::of(&sent);
+                    card.marks.sent(!sent.is_empty());
+                    *card.sent.lock().unwrap() = sent;
                 }
                 let pieces: Vec<(usize, usize)> = (0..3).map(|p| (p * PIECE + 16, (p + 1) * PIECE - 4)).collect();
                 let mut scratch = Vec::new();
@@ -5615,6 +5653,8 @@ mod land_tests {
                     let mut dirty = card.dirty.lock().unwrap();
                     let mut sent = card.sent.lock().unwrap();
                     sent.note(9, std::mem::take(&mut *dirty));
+                    card.marks.sent(!sent.is_empty());
+                    card.marks.taken();
                 }
             });
             let mut now = vec![0u8; LEN];
@@ -5937,6 +5977,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                 touched: Default::default(),
+                marks: Default::default(),
                 me: std::sync::OnceLock::new(),
                     size,
                 };
@@ -6242,6 +6283,7 @@ pub(crate) fn by_address(start: u64, len: u64, fresh: bool) -> Option<Arc<Shadow
         dirty: Mutex::default(),
         sent: Mutex::default(),
         touched: Default::default(),
+        marks: Default::default(),
         me: std::sync::OnceLock::new(),
         size: len,
     });
@@ -6332,6 +6374,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                marks: Default::default(),
                 me: std::sync::OnceLock::new(),
                 size: len,
             };
