@@ -3750,6 +3750,7 @@ fn relay_hand_back(back: &[Declared]) -> RelayBack {
         join_ranges(&mut spans, declared.iter().copied());
         for &(from, to) in &spans {
             shadow.relay_compared(from, to - from);
+            crate::land::early::will_write(from, to - from);
         }
         work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
     }
@@ -3922,6 +3923,7 @@ fn late_line(frames: f64) {
         }
     }
     crate::land::log(frames);
+    crate::land::early::log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -5135,6 +5137,9 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
+        for (shadow, lo, hi, _) in &pieces {
+            crate::land::early::will_write(shadow.span().0 as usize + lo, hi - lo);
+        }
         let merging = std::time::Instant::now();
         let _merging = crate::timeline::span("landing: merging fetched pieces");
         let mut written = 0;
@@ -5205,6 +5210,7 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        crate::land::early::begin();
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -5296,6 +5302,7 @@ impl Host {
                 }
                 Late::Signal(fence, value) => {
                     crate::fence::set(fence as crate::object::This, value);
+                    crate::land::early::told();
                     if let Some(lag) = &lag {
                         lag.told();
                     }
@@ -5303,6 +5310,7 @@ impl Host {
                 }
             };
         }
+        crate::land::early::end();
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             bury(last);

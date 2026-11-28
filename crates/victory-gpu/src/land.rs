@@ -70,6 +70,8 @@ pub(crate) fn skip_on() -> bool {
 }
 
 /// Since the last frame-rate line; microseconds first.
+pub(crate) mod early;
+
 pub(crate) mod stat {
     /// Which pieces to fetch; their list recorded and sent.
     pub(crate) const GATHER: usize = 0;
