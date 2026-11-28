@@ -27,6 +27,7 @@ use crate::watch::PAGE;
 mod exact_fast;
 // The title's bytes under flights' writes, compared and put in in one pass.
 mod small_bar;
+mod take_batch;
 pub(crate) mod under_fused;
 use under_fused::{Compared, UNDER_NS, under_fused, under_ns};
 
@@ -4893,6 +4894,9 @@ impl Shadow {
             return self.copy(from, to);
         };
         let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        if take_batch::on() {
+            return take_batch::take_batched(self, from, to, whole);
+        }
         let start = self.start as usize;
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
